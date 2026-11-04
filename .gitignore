@@ -1,0 +1,7 @@
+firmware/.pio/
+firmware/sdkconfig.esp32c3
+firmware/sdkconfig.*.old
+build/
+builds/
+__pycache__/
+.venv/
