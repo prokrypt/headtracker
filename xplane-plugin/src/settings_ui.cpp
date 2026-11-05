@@ -35,8 +35,8 @@ struct Check {
 };
 
 std::vector<Slider> gSliders = {
-    {"Yaw gain", &Config::gainYaw, 0.25, 3.0, 0.05, "%.2fx"},
-    {"Pitch gain", &Config::gainPitch, 0.25, 3.0, 0.05, "%.2fx"},
+    {"Yaw gain", &Config::gainYaw, 0.0, 3.0, 0.05, "%.2fx"},
+    {"Pitch gain", &Config::gainPitch, 0.0, 3.0, 0.05, "%.2fx"},
     {"Roll gain", &Config::gainRoll, 0.0, 3.0, 0.05, "%.2fx"},
     {"Deadzone", &Config::deadzoneDeg, 0.0, 5.0, 0.1, "%.1f deg"},
     {"Smoothing", &Config::smoothingMs, 0.0, 100.0, 1.0, "%.0f ms"},
