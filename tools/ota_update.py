@@ -46,6 +46,10 @@ ESP_IMAGE_MAGIC = 0xE9
 ESP32C3_CHIP_ID = 5
 
 
+class FastPathFailed(Exception):
+    """The fast transfer stalled (data lost on the way). The tracker restarts itself."""
+
+
 class OtaError(Exception):
     pass
 
@@ -74,7 +78,7 @@ async def read_info(client) -> dict:
     return dict(kv.split("=", 1) for kv in raw.split(";") if "=" in kv)
 
 
-async def chunk_size(client) -> int:
+async def negotiated_mtu(client) -> int:
     # On Linux, BlueZ only reports the real MTU after this call.
     backend = getattr(client, "_backend", None)
     if hasattr(backend, "_acquire_mtu"):
@@ -82,20 +86,41 @@ async def chunk_size(client) -> int:
             await backend._acquire_mtu()
         except Exception:
             pass
-    mtu = client.mtu_size
-    # 512 is the largest single write. With a small MTU, BlueZ splits a
-    # 512-byte write into a "long write" itself, which is still correct.
-    return 512 if mtu <= 23 else max(20, min(512, mtu - 3))
+    return client.mtu_size
 
 
-async def send_image(client, image: bytes, log=print) -> None:
+def supports_fast_path(client) -> bool:
+    """Firmware 1.2.2+ accepts image data as write-without-response."""
+    ch = client.services.get_characteristic(DATA_UUID)
+    return ch is not None and "write-without-response" in ch.properties
+
+
+# Fast path: bytes in flight beyond the tracker's last PROGRESS count. The
+# tracker acknowledges every 2 KB and buffers 32 writes, so this keeps the
+# radio busy without ever filling its queue.
+# Measured 2026-11-04 with a BT 4.0 CSR dongle: 2 KB lost nothing (21.7 KB/s),
+# 4 KB lost data. A loss stalls the transfer; the tool then retries with
+# acknowledged writes (see main_async).
+WINDOW_BYTES = 2048
+
+
+async def send_image(client, image: bytes, log=print, allow_fast=True, window_bytes=WINDOW_BYTES) -> None:
     status_q: asyncio.Queue = asyncio.Queue()
 
+    acked = 0                      # tracker's latest PROGRESS count
+    acked_event = asyncio.Event()  # set whenever it moves (or an error arrives)
+
     def on_status(_, data: bytearray):
+        nonlocal acked
         if len(data) >= 6:
             code, err = data[0], data[1]
             received = struct.unpack_from("<I", data, 2)[0]
+            if code == ST_PROGRESS:
+                acked = max(acked, received)
+                acked_event.set()
+                return
             status_q.put_nowait((code, err, received))
+            acked_event.set()
 
     async def wait_for(code_wanted: int, timeout: float):
         deadline = time.monotonic() + timeout
@@ -127,18 +152,53 @@ async def send_image(client, image: bytes, log=print) -> None:
         log("Preparing the update slot...")
         await wait_for(ST_READY, 30)  # erasing flash takes a few seconds
 
-        size = await chunk_size(client)
+        mtu = await negotiated_mtu(client)
+        # Write without response must fit in one ATT packet (MTU - 3, at most
+        # 512). If the MTU is unknown, or the firmware predates the fast path,
+        # use acknowledged writes: BlueZ splits a 512-byte write into a "long
+        # write" itself, which is slower but always correct.
+        fast = allow_fast and mtu > 23 and supports_fast_path(client)
+        size = min(512, mtu - 3) if fast else (512 if mtu <= 23 else max(20, min(512, mtu - 3)))
+        window = min(window_bytes, 16 * size)
         start = time.monotonic()
         sent = 0
+        last_log = 0.0
+
+        def show(force=False):
+            nonlocal last_log
+            now = time.monotonic()
+            if not force and now - last_log < 0.25:
+                return
+            last_log = now
+            done = acked if fast else sent
+            rate = done / max(0.001, now - start) / 1024
+            log(f"\rSending {100 * done // len(image):3d}%  {done // 1024} / {len(image) // 1024} KB  {rate:.1f} KB/s", end="")
+
         while sent < len(image):
+            if fast:
+                while sent - acked >= window:
+                    acked_event.clear()
+                    check_errors()
+                    try:
+                        await asyncio.wait_for(acked_event.wait(), 10)
+                    except asyncio.TimeoutError:
+                        raise FastPathFailed() from None
             chunk = image[sent:sent + size]
-            await client.write_gatt_char(DATA_UUID, chunk, response=True)
+            await client.write_gatt_char(DATA_UUID, chunk, response=not fast)
             sent += len(chunk)
             check_errors()
-            pct = 100 * sent // len(image)
-            rate = sent / max(0.001, time.monotonic() - start) / 1024
-            log(f"\rSending {pct:3d}%  {sent // 1024} / {len(image) // 1024} KB  {rate:.1f} KB/s", end="")
-        log("")
+            show()
+        # The tracker reports PROGRESS at the last byte too. Waiting for it
+        # keeps END from overtaking data still queued in BlueZ.
+        while fast and acked < len(image):
+            acked_event.clear()
+            check_errors()
+            try:
+                await asyncio.wait_for(acked_event.wait(), 10)
+            except asyncio.TimeoutError:
+                raise FastPathFailed() from None
+        show(force=True)
+        log(f"  ({'fast' if fast else 'acknowledged'} writes, {size} B, MTU {mtu})")
         await client.write_gatt_char(CTRL_UUID, bytes([CMD_END]), response=True)
         log("Verifying...")
         await wait_for(ST_DONE, 30)
@@ -179,7 +239,20 @@ async def main_async(args) -> int:
     check_image(image)
     print(f"Firmware: {args.firmware} ({len(image) // 1024} KB)")
 
-    dev = await find_tracker(args.name, args.address, 15)
+    try:
+        return await attempt(args, image, allow_fast=not args.no_fast)
+    except FastPathFailed:
+        # The tracker gives up on the transfer after 10 s without data and
+        # restarts (its firmware is unchanged), which also clears whatever
+        # Bluetooth buffers the lost data left stuck.
+        print("\nThe fast transfer lost data. Waiting for the tracker to restart, then "
+              "sending again with acknowledged writes (slower, but every write is confirmed)...")
+        await asyncio.sleep(8)
+        return await attempt(args, image, allow_fast=False)
+
+
+async def attempt(args, image: bytes, allow_fast: bool) -> int:
+    dev = await find_tracker(args.name, args.address, 30)
     print(f"Found {dev.name or args.name} ({dev.address})")
     async with BleakClient(dev) as client:
         try:
@@ -190,7 +263,7 @@ async def main_async(args) -> int:
         print(f"Running: version {before.get('version')} in {before.get('slot')}")
         if before.get("state") == "probation":
             raise OtaError("the tracker is still checking its last update. Wait a minute and try again.")
-        await send_image(client, image)
+        await send_image(client, image, allow_fast=allow_fast, window_bytes=args.window)
         # The tracker reboots now. If that drops the link before we let go of it
         # (or the plugin shares the same connection), disconnecting may fail.
         try:
@@ -217,6 +290,8 @@ def main() -> int:
     p.add_argument("firmware", help="firmware.bin from .pio/build/esp32c3/")
     p.add_argument("--name", default="HeadTrackerC3", help="Bluetooth name (default HeadTrackerC3)")
     p.add_argument("--address", help="Bluetooth address, if you have several trackers")
+    p.add_argument("--no-fast", action="store_true", help="use acknowledged writes only (slower)")
+    p.add_argument("--window", type=int, default=WINDOW_BYTES, help=argparse.SUPPRESS)
     args = p.parse_args()
     try:
         return asyncio.run(main_async(args))

@@ -88,7 +88,7 @@ static NimBLECharacteristic *ctrlChar = nullptr;
 static QueueHandle_t cmdQueue;  // control commands, from the BLE task to loop()
 static bool sensorOk = false;
 static bool sensorAwake = false;
-static bool intWired = false;  // set once we see INT go low or fire
+[[maybe_unused]] static bool intWired = false;  // set once we see INT go low or fire (unused in the fake build)
 static uint8_t seq = 0;
 static uint8_t sensorEpoch = 0;  // +1 whenever the BNO085 (re)starts; its yaw reference starts over then
 static uint32_t sensorStartMs = 0;  // when it last (re)started, for the "stopped reporting" check

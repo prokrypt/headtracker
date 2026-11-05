@@ -6,6 +6,12 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/queue.h>
 #include <mbedtls/sha256.h>
+#include <Preferences.h>
+#if defined(CONFIG_NIMBLE_CPP_IDF)
+#include "services/gatt/ble_svc_gatt.h"
+#else
+#include "nimble/nimble/host/services/gatt/include/services/gatt/ble_svc_gatt.h"
+#endif
 #if CONFIG_PM_ENABLE
 #include <esp_pm.h>
 #endif
@@ -31,7 +37,12 @@ enum : uint8_t {
 
 const uint32_t kHealthyAfterMs = 15000;   // a new image must run this long to be kept
 const uint64_t kProbationUs = 60000000;   // ...and must get there within 60 s
-const uint32_t kProgressEvery = 16384;
+// PROGRESS is also the flow control for the fast path (write without
+// response): the PC keeps at most a window of unacknowledged bytes in flight,
+// smaller than the queue below, so the queue never fills and the BLE host
+// task never blocks.
+const uint32_t kProgressEvery = 1024;
+const UBaseType_t kQueueLen = 32;  // 32 x 512 B = 16 KB of buffered image data
 // Give up on a transfer that stops sending data. Without this, an updater that
 // is killed while sharing X-Plane's connection (so no disconnect ever arrives)
 // would leave tracking paused until the tracker is power-cycled.
@@ -45,6 +56,7 @@ struct Msg {
 
 QueueHandle_t gQueue;
 NimBLECharacteristic *gCtrl, *gInfo;
+NimBLEServer *gServer;
 volatile bool gActive = false;
 volatile uint16_t gOtaConn = 0xFFFF;
 volatile bool gPendingVerify = false;
@@ -77,6 +89,16 @@ void holdAwake(bool on) {
 #endif
 }
 
+// 7.5 ms connection interval while an image streams in: twice the connection
+// events of the normal 7.5-15 ms request, which BlueZ settles at 15 ms.
+// Tracking is paused during an update, so nothing else needs the link then.
+void setFastLink(bool fast) {
+  uint16_t conn = gOtaConn;
+  if (!gServer || conn == 0xFFFF) return;
+  if (fast) gServer->updateConnParams(conn, 6, 6, 0, 200);
+  else gServer->updateConnParams(conn, 6, 12, 0, 200);
+}
+
 void enqueue(uint8_t type, const uint8_t *data, size_t len, TickType_t wait) {
   Msg m;
   m.type = type;
@@ -96,13 +118,25 @@ void otaTask(void *) {
   uint32_t expected = 0, received = 0, lastReport = 0;
   bool failed = false;  // report only the first error of a transfer
 
-  auto stop = [&](uint8_t err) {
+  auto stop = [&](uint8_t err, bool mayRestart = true) {
+    bool wasActive = gActive;
+    if (gActive) setFastLink(false);
     if (gActive) esp_ota_abort(handle);
     if (gActive) holdAwake(false);
     gActive = false;
     if (err != ERR_NONE && !failed) status(ST_ERROR, err, received);
     if (err != ERR_NONE) failed = true;
     mbedtls_sha256_free(&sha);
+    // A transfer that stopped partway (data lost, stall, abort, PC gone) may
+    // have lost writes, and those can leave NimBLE's buffers stuck: every
+    // later write then crawls (measured: 512 B took 2.4 s instead of 48 ms)
+    // until a reset. The running firmware is untouched, so restarting is safe
+    // and fixes it. Not when a new BEGIN replaces the transfer.
+    if (mayRestart && wasActive && received > 0) {
+      Serial.println("OTA: transfer failed, restarting to clear Bluetooth buffers");
+      vTaskDelay(pdMS_TO_TICKS(300));  // let the error notification go out
+      esp_restart();
+    }
   };
   mbedtls_sha256_init(&sha);
 
@@ -116,7 +150,7 @@ void otaTask(void *) {
     }
     switch (m.type) {
       case CMD_BEGIN: {
-        if (gActive) stop(ERR_NONE);
+        if (gActive) stop(ERR_NONE, false);
         failed = false;
         received = lastReport = 0;
         if (m.len != 1 + 4 + 32) { status(ST_ERROR, ERR_BAD_CMD, 0); break; }
@@ -136,6 +170,7 @@ void otaTask(void *) {
         }
         mbedtls_sha256_init(&sha);
         mbedtls_sha256_starts_ret(&sha, 0);
+        setFastLink(true);
         gActive = true;
         status(ST_READY, ERR_NONE, 0);
         break;
@@ -150,7 +185,7 @@ void otaTask(void *) {
         if (esp_ota_write(handle, m.data, m.len) != ESP_OK) { stop(ERR_WRITE); break; }
         mbedtls_sha256_update_ret(&sha, m.data, m.len);
         received += m.len;
-        if (received - lastReport >= kProgressEvery) {
+        if (received - lastReport >= kProgressEvery || received == expected) {
           lastReport = received;
           status(ST_PROGRESS, ERR_NONE, received);
         }
@@ -210,6 +245,53 @@ void probationExpired(void *) {
   esp_ota_mark_app_invalid_rollback_and_reboot();
 }
 
+// ---- Telling the PC that the Bluetooth services changed ----
+// BlueZ caches a device's GATT table, even without pairing, and keeps using
+// the cached copy after a firmware update. So a new or changed characteristic
+// (like write-without-response on 0012 in 1.2.2) stays invisible until the
+// cache is cleared. The standard fix: indicate "Service Changed" for the whole
+// table. BlueZ subscribes to it right after connecting, so that's when we send
+// it, but only once per firmware image (its ELF SHA-256 is kept in flash once
+// the PC has acknowledged), so normal connections don't trigger a rediscovery.
+// With several PCs, only the first one to connect after an update gets it.
+uint16_t gSvcChangedHandle = 0;
+bool gAnnounced = false;  // this image already told a PC (or did just now)
+bool gIndicating = false;
+
+const uint8_t *imageSha() { return esp_ota_get_app_description()->app_elf_sha256; }
+
+bool imageAnnounced() {
+  Preferences p;
+  if (!p.begin("ota", true)) return false;
+  uint8_t sha[8] = {};
+  bool same = p.getBytes("gatt_sha", sha, sizeof(sha)) == sizeof(sha) && memcmp(sha, imageSha(), sizeof(sha)) == 0;
+  p.end();
+  return same;
+}
+
+void rememberAnnounced() {
+  Preferences p;
+  if (!p.begin("ota", false)) return;
+  p.putBytes("gatt_sha", imageSha(), 8);
+  p.end();
+}
+
+int onGapEvent(ble_gap_event *ev, void *) {
+  if (!gSvcChangedHandle || gAnnounced) return 0;
+  if (ev->type == BLE_GAP_EVENT_SUBSCRIBE && ev->subscribe.attr_handle == gSvcChangedHandle &&
+      ev->subscribe.cur_indicate) {
+    Serial.println("OTA: new firmware, telling the PC to re-read the services");
+    gIndicating = true;
+    ble_svc_gatt_changed(0x0001, 0xFFFF);
+  } else if (ev->type == BLE_GAP_EVENT_NOTIFY_TX && gIndicating && ev->notify_tx.attr_handle == gSvcChangedHandle &&
+             ev->notify_tx.indication && ev->notify_tx.status == BLE_HS_EDONE) {  // the PC acknowledged it
+    gIndicating = false;
+    gAnnounced = true;
+    rememberAnnounced();
+  }
+  return 0;
+}
+
 }  // namespace
 
 // The Arduino core asks this at boot. Returning true means "don't confirm the
@@ -221,13 +303,14 @@ void otaSetup(NimBLEServer *server) {
   esp_pm_lock_create(ESP_PM_NO_LIGHT_SLEEP, 0, "ota", &gNoSleep);
   esp_pm_lock_create(ESP_PM_CPU_FREQ_MAX, 0, "ota", &gFullSpeed);
 #endif
-  gQueue = xQueueCreate(8, sizeof(Msg));
+  gServer = server;
+  gQueue = xQueueCreate(kQueueLen, sizeof(Msg));
   xTaskCreate(otaTask, "ota", 8192, nullptr, 5, nullptr);
 
   NimBLEService *svc = server->createService(OTA_SERVICE_UUID);
   gCtrl = svc->createCharacteristic(OTA_CTRL_UUID, NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::NOTIFY);
   gCtrl->setCallbacks(new CtrlCallbacks());
-  NimBLECharacteristic *data = svc->createCharacteristic(OTA_DATA_UUID, NIMBLE_PROPERTY::WRITE);
+  NimBLECharacteristic *data = svc->createCharacteristic(OTA_DATA_UUID, NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::WRITE_NR);
   data->setCallbacks(new DataCallbacks());
   gInfo = svc->createCharacteristic(OTA_INFO_UUID, NIMBLE_PROPERTY::READ);
   svc->start();
@@ -237,6 +320,13 @@ void otaSetup(NimBLEServer *server) {
   gPendingVerify = running && esp_ota_get_state_partition(running, &st) == ESP_OK &&
                    st == ESP_OTA_IMG_PENDING_VERIFY;
   updateInfo(gPendingVerify ? "probation" : "valid");
+
+  gAnnounced = imageAnnounced();
+  // GATT service 0x1801, Service Changed 0x2A05 (BLE_UUID16_DECLARE is C-only).
+  static const ble_uuid16_t kGattSvc = {{BLE_UUID_TYPE_16}, 0x1801}, kSvcChanged = {{BLE_UUID_TYPE_16}, 0x2A05};
+  if (ble_gatts_find_chr(&kGattSvc.u, &kSvcChanged.u, nullptr, &gSvcChangedHandle) != 0)
+    gSvcChangedHandle = 0;
+  NimBLEDevice::setCustomGapHandler(onGapEvent);
   if (gPendingVerify) {
     Serial.println("OTA: new firmware on probation");
     esp_timer_create_args_t args = {};
