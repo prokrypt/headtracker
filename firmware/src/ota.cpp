@@ -64,7 +64,9 @@ void updateInfo(const char *state) {
   const esp_partition_t *running = esp_ota_get_running_partition();
   String s = String("version=") + FW_VERSION + ";slot=" + (running ? running->label : "?") +
              ";state=" + state;
-  gInfo->setValue(s.c_str());
+  // Not setValue(s.c_str()): NimBLE 1.4's setValue<T> template takes a
+  // const char* as T and stores the 4 pointer bytes instead of the text.
+  gInfo->setValue((const uint8_t *)s.c_str(), s.length());
 }
 
 void holdAwake(bool on) {

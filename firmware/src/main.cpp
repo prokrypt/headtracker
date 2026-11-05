@@ -464,7 +464,11 @@ void loop() {
 
 #if FAKE_SENSOR
   // One simulated sample every 10 ms (100 Hz, like the real report rate).
-  vTaskDelay(pdMS_TO_TICKS(REPORT_INTERVAL_US / 1000));
+  // DelayUntil keeps the average at exactly 100 Hz; a plain delay adds the
+  // loop's own time to every period (measured 89 Hz).
+  static TickType_t nextWake = xTaskGetTickCount();
+  if ((int32_t)(xTaskGetTickCount() - nextWake) > (int32_t)pdMS_TO_TICKS(100)) nextWake = xTaskGetTickCount();  // after a pause, don't burst to catch up
+  vTaskDelayUntil(&nextWake, pdMS_TO_TICKS(REPORT_INTERVAL_US / 1000));
   Q fq = fakeSensorQ();
   float q[4] = {fq.w, fq.x, fq.y, fq.z};
 #else
