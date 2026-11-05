@@ -32,3 +32,10 @@ CONFIG_BT_CTRL_LPCLK_SEL_MAIN_XTAL=y
 # a no-light-sleep lock for as long as Bluetooth is on, so the chip never sleeps.
 CONFIG_BT_CTRL_MAIN_XTAL_PU_DURING_LIGHT_SLEEP=y
 CONFIG_ESP32C3_DEFAULT_CPU_FREQ_160=y
+
+# M5Stack Core (classic ESP32, pio env m5core): run at a fixed 80MHz, the
+# lowest clock Bluetooth allows. The work (200Hz fusion, 100Hz BLE) fits
+# easily, and with the CPU at 80MHz the peripheral clock stays at 80MHz too, so
+# UART, I2C and the LED bar timing don't change. (No frequency scaling: the
+# Arduino UART and NeoPixel code don't follow clock changes made by esp_pm.)
+CONFIG_ESP32_DEFAULT_CPU_FREQ_80=y

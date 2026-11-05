@@ -48,8 +48,10 @@
 // imu6886.h). Same protocol; it advertises as HeadTracker-M5. Button A recenters, button B calibrates the compass.
 // It powers itself off after a minute lying still or a minute without a
 // connection (red button or button A turns it back on). With the M5GO/Fire
-// base fitted, its LED bar shows power on/off and connection changes briefly. No light sleep on
-// that board (no 32kHz crystal for BLE).
+// base fitted, its LED bar shows power on/off and connection changes briefly,
+// and blinks red at both ends when the battery is down to its last gauge step
+// (about 25%; the whole bar when nearly empty). No light sleep on that board
+// (no 32kHz crystal for BLE); it runs at a fixed 80MHz and sends at 0dBm instead.
 
 #include <Arduino.h>
 #include <Wire.h>
@@ -371,7 +373,7 @@ static void setupPower() {
   esp_pm_lock_acquire(usbLock);  // until we know whether a computer is attached
   usbLockHeld = true;
 #else
-  Serial.println("Power: no light sleep on this build");
+  Serial.printf("Power: no light sleep on this build, CPU %uMHz\n", (unsigned)getCpuFrequencyMhz());
 #endif
 }
 
@@ -492,7 +494,16 @@ static void sensorSleep(bool sleep) {
 
 static void startBle() {
   NimBLEDevice::init(DEVICE_NAME);
-  NimBLEDevice::setPower(ESP_PWR_LVL_P9);
+#if IMU_MPU6886
+  // The M5Stack's antenna is decent and the PC is a metre or two away: 0dBm
+  // instead of +9dBm saves some battery. DEFAULT covers the connections.
+  NimBLEDevice::setPower(ESP_PWR_LVL_N0, ESP_BLE_PWR_TYPE_DEFAULT);
+  NimBLEDevice::setPower(ESP_PWR_LVL_N0, ESP_BLE_PWR_TYPE_ADV);
+  Serial.printf("BLE TX power: level %d default, %d adv (0..7 = -12..+9dBm)\n",
+                esp_ble_tx_power_get(ESP_BLE_PWR_TYPE_DEFAULT), esp_ble_tx_power_get(ESP_BLE_PWR_TYPE_ADV));
+#else
+  NimBLEDevice::setPower(ESP_PWR_LVL_P9);  // the Super Mini's antenna is weak
+#endif
   NimBLEDevice::setMTU(517);  // big packets make OTA fast
   server = NimBLEDevice::createServer();
   server->setCallbacks(new ServerCallbacks());
@@ -562,6 +573,9 @@ static void setFrame(int i, uint32_t c) {
   if (ledFrame[i] != c) { ledFrame[i] = c; ledsDirty = true; }
 }
 
+enum class Battery : uint8_t { Ok, Low, Empty };  // see updateBattery()
+static Battery battery = Battery::Ok;
+
 static void updateLeds(bool waiting, float calProgress) {
   static uint32_t lastMs = 0;
   if (millis() - lastMs < 20) return;  // 50 frames/s is plenty
@@ -606,6 +620,15 @@ static void updateLeds(bool waiting, float calProgress) {
         } else if (waiting && millis() % 3000 < 120 && (i == 4 || i == 5)) {
           c = rgb(0, 0.2f, 1, 0.5f);  // waiting for X-Plane: short blue blip
         }
+        // Low battery: red double blink at both ends every 3s. Nearly empty:
+        // the whole bar blinks red every second.
+        if (calProgress < 0) {
+          uint32_t b3 = millis() % 3000;
+          bool lowOn = (b3 < 150 || (b3 >= 300 && b3 < 450)) && (i <= 1 || i >= NUM_LEDS - 2);
+          bool emptyOn = millis() % 1000 < 150;
+          if (battery == Battery::Low && lowOn) c = rgb(1, 0, 0, 1);
+          if (battery == Battery::Empty && emptyOn) c = rgb(1, 0, 0, 1);
+        }
         break;
     }
     setFrame(i, c);
@@ -619,6 +642,45 @@ static void updateLeds(bool waiting, float calProgress) {
 // IP5306 power chip, SYS_CTL0 bit1: keep the 5V boost on even at light load.
 // Off, it cuts the board's power ~30s after the load drops (that's how we
 // power off on battery: deep sleep draws next to nothing).
+static bool ip5306Read(uint8_t reg, uint8_t &v) {
+  Wire.beginTransmission(0x75);
+  Wire.write(reg);
+  if (Wire.endTransmission(false) != 0 || Wire.requestFrom(0x75, 1) != 1) return false;
+  v = Wire.read();
+  return true;
+}
+
+// Battery: the IP5306 only knows its four fuel-gauge steps (REG 0x78 high
+// nibble 0x0/0x8/0xC/0xE = 100/75/50/25%, anything else = nearly empty), so
+// "low" means down to its last step, about 25%. Checked every 10s; three low
+// readings in a row (30s) turn the warning on. It stays on until external
+// power shows up (REG 0x70 bit3), because the voltage, and with it the gauge,
+// bounces back up whenever the load drops.
+static void updateBattery() {
+  static uint32_t last = 0;
+  static uint8_t lowCount = 0, emptyCount = 0;
+  if (last != 0 && millis() - last < 10000) return;
+  last = millis();
+  uint8_t ctl, gauge;
+  if (!ip5306Read(0x70, ctl) || !ip5306Read(0x78, gauge)) return;
+  if (ctl & 0x08) {  // on USB power (charging or full)
+    if (battery != Battery::Ok) Serial.println("Battery: external power, warning off");
+    battery = Battery::Ok;
+    lowCount = emptyCount = 0;
+    return;
+  }
+  uint8_t step = gauge >> 4;
+  bool low = step != 0x0 && step != 0x8 && step != 0xC;  // 25% step or below
+  bool empty = low && step != 0xE;
+  lowCount = low ? (lowCount < 3 ? lowCount + 1 : 3) : 0;
+  emptyCount = empty ? (emptyCount < 3 ? emptyCount + 1 : 3) : 0;
+  Battery b = battery;
+  if (emptyCount >= 3) b = Battery::Empty;
+  else if (lowCount >= 3 && b == Battery::Ok) b = Battery::Low;
+  if (b != battery) Serial.printf("Battery: %s (gauge 0x%02x)\n", b == Battery::Empty ? "nearly empty" : "low", gauge);
+  battery = b;
+}
+
 static void ip5306KeepOn(bool on) {
   Wire.beginTransmission(0x75);
   Wire.write(0x00);
@@ -735,6 +797,7 @@ static void m5Housekeeping() {
   if (connected != wasConnected) ledAnim(connected ? Anim::Connected : Anim::Disconnected);
   wasConnected = connected;
   float calProgress = magCalibrator.active ? fminf(1.0f, magCalibrator.elapsedMs() / (float)MagCalibrator::kDurationMs) : -1.0f;
+  updateBattery();
   updateLeds(!connected, calProgress);
   static uint8_t bCount = 0;
   static bool bWas = false;
