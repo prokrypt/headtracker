@@ -5,6 +5,8 @@ Nothing has to run outside X-Plane. OpenTrack and your old head-track plugin are
 
 ## 1. Wiring
 
+![Wiring diagram](docs/wiring.png)
+
 | BNO085 board | ESP32-C3 Super Mini |
 |---|---|
 | VCC | 3V3 |
