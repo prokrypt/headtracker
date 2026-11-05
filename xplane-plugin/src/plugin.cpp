@@ -308,10 +308,31 @@ Vec3 eyeOffset(const Angles &view) {
 }
 
 // Take all of our offsets (angles and eye position) back out of X-Plane's head.
+// Writes the head datarefs only if something is applied: writing them while
+// an outside view is active sends X-Plane back to the 3D cockpit.
 void removeOffsets() {
-  applyOffsets(Angles(), Vec3());
+  bool applied = gApplied.yaw != 0 || gApplied.pitch != 0 || gApplied.roll != 0 ||
+                 gAppliedPos.x != 0 || gAppliedPos.y != 0 || gAppliedPos.z != 0;
+  if (applied) applyOffsets(Angles(), Vec3());
   gSmoothed = gSmoothedHead = Angles();
   gTorso = 0;
+}
+
+// X-Plane's view-change commands. Before one runs we take our offsets out,
+// while still in the cockpit, so nothing is left to write once the view has
+// changed (that write would pull X-Plane back into the cockpit).
+const char *const kViewCommands[] = {
+    "sim/view/free_camera", "sim/view/default_view", "sim/view/forward_with_2d_panel",
+    "sim/view/forward_with_hud", "sim/view/forward_with_nothing", "sim/view/linear_spot",
+    "sim/view/still_spot", "sim/view/runway", "sim/view/circle", "sim/view/tower",
+    "sim/view/ridealong", "sim/view/track_weapon", "sim/view/chase", "sim/view/wingman",
+    "sim/view/3d_cockpit_toggle", "sim/view/ai_controls_views",
+};
+std::vector<XPLMCommandRef> gViewCmds;
+
+int beforeViewCommand(XPLMCommandRef, XPLMCommandPhase phase, void *) {
+  if (phase == xplm_CommandBegin) removeOffsets();
+  return 1;  // let X-Plane carry on with the command
 }
 
 double wrap180(double a) {
@@ -750,6 +771,11 @@ PLUGIN_API int XPluginStart(char *outName, char *outSig, char *outDesc) {
   XPLMRegisterCommandHandler(gCmdCalibrate, handleCommand, 1, nullptr);
   XPLMRegisterCommandHandler(gCmdToggle, handleCommand, 1, nullptr);
   XPLMRegisterCommandHandler(gCmdSettings, handleCommand, 1, nullptr);
+  for (const char *name : kViewCommands)
+    if (XPLMCommandRef c = XPLMFindCommand(name)) {
+      XPLMRegisterCommandHandler(c, beforeViewCommand, 1, nullptr);
+      gViewCmds.push_back(c);
+    }
 
   uiStart();
   return 1;
@@ -760,6 +786,8 @@ PLUGIN_API void XPluginStop() {
   XPLMUnregisterCommandHandler(gCmdToggle, handleCommand, 1, nullptr);
   XPLMUnregisterCommandHandler(gCmdSettings, handleCommand, 1, nullptr);
   XPLMUnregisterCommandHandler(gCmdCalibrate, handleCommand, 1, nullptr);
+  for (XPLMCommandRef c : gViewCmds) XPLMUnregisterCommandHandler(c, beforeViewCommand, 1, nullptr);
+  gViewCmds.clear();
   uiStop();
   if (!gRetiredLinks.empty()) debug("waiting for the Bluetooth thread to finish connecting");
   gRetiredLinks.clear();  // joins them
