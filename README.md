@@ -112,17 +112,19 @@ cd firmware && pio run              # builds .pio/build/esp32c3/firmware.bin
 ~/.venvs/headtracker/bin/python ../tools/ota_update.py .pio/build/esp32c3/firmware.bin
 ```
 
-`builds/firmware.bin` is a prebuilt copy of the current firmware (1.2.0) if you don't want to build it.
+`builds/firmware.bin` is a prebuilt copy of the firmware if you don't want to build it (it may be older than the source).
 
-It takes about a minute. X-Plane can stay open: tracking pauses during the update and comes back by itself.
+It takes about 40 s (sending ~25 s, then a 15 s health check). With 1.2.5 or newer on the tracker, the updater streams the image (write without response, at most 2 KB ahead of what the tracker has confirmed) on a 7.5 ms connection interval: 25 KB/s with a plain Bluetooth 4.0 dongle, about 2.5x the old acknowledged writes. Older firmware gets the old way (10 KB/s), so the first update to 1.2.5 is the slow one. If a streamed transfer loses data, the tracker restarts and the updater sends again with acknowledged writes; `--no-fast` forces those from the start. X-Plane can stay open: tracking pauses during the update and comes back by itself.
 Bump `FW_VERSION` in `platformio.ini` so you can see the new version reported at the end.
 
 If X-Plane is running on the same PC, the updater shares the plugin's Bluetooth connection, so the plugin drops and reconnects by itself when the tracker reboots.
 
-It's safe to interrupt. The tracker keeps two firmware slots and only switches after the whole image arrives and its SHA-256 checks out.
+It's safe to interrupt. An interrupted transfer restarts the tracker on its current firmware (that clears any Bluetooth buffers the lost data left stuck). The tracker keeps two firmware slots and only switches after the whole image arrives and its SHA-256 checks out.
 The new firmware then runs "on probation": if it crashes, or isn't up and healthy within 60 s, the tracker goes back to the old one on its own.
 If the sensor is unplugged the firmware still counts as healthy, so you can always push a fix over Bluetooth.
 While new firmware is still on probation (its first 15 s), the tracker refuses another update, because the other slot holds the old firmware it would go back to.
+
+After a firmware change, the first PC to connect is told the Bluetooth services changed ("Service Changed"), because BlueZ keeps a cached copy of them even without pairing and would otherwise miss new features.
 
 Anyone within Bluetooth range could send firmware too, since there's no pairing. For a head tracker that's a small risk, but keep it in mind.
 
