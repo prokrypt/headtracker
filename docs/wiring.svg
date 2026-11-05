@@ -1,7 +1,7 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1500" height="1180" viewBox="0 0 1500 1180" font-family="DejaVu Sans, Arial, sans-serif">
   <rect width="1500" height="1180" fill="#ffffff"/>
   <text x="750" y="60" text-anchor="middle" font-size="34" font-weight="bold" fill="#111">BNO085 → ESP32-C3 Super Mini wiring</text>
-  <text x="750" y="98" text-anchor="middle" font-size="19" fill="#555">I2C mode · C3 seen from the chip/button side, USB-C at the top · match pins by their printed labels</text>
+  <text x="750" y="98" text-anchor="middle" font-size="19" fill="#555">I2C mode · C3 seen from the button side, USB-C up · GPIO numbers are usually printed on the back, where the rows are mirrored</text>
 
   <!-- ===== BNO085 board ===== -->
   <rect x="170" y="210" width="270" height="460" rx="14" fill="#5b2a86" stroke="#3a1a57" stroke-width="3"/>
