@@ -360,6 +360,7 @@ void createWindow() {
 void menuHandler(void *, void *item) {
   if (item == (void *)1) uiToggle();
   if (item == (void *)2) requestRecenter();
+  if (item == (void *)3) startHeadLog();
 }
 
 }  // namespace
@@ -369,6 +370,7 @@ void uiStart() {
   gMenu = XPLMCreateMenu("Head Tracker", XPLMFindPluginsMenu(), idx, menuHandler, nullptr);
   XPLMAppendMenuItem(gMenu, "Settings...", (void *)1, 0);
   XPLMAppendMenuItem(gMenu, "Recenter", (void *)2, 0);
+  XPLMAppendMenuItem(gMenu, "Log head values (10s)", (void *)3, 0);
 }
 
 void uiStop() {

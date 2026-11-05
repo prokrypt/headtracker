@@ -281,18 +281,46 @@ double shape(double deg, double gain, bool invert, double limit) {
   return std::fmax(-limit, std::fmin(limit, out));
 }
 
-// Add our offset on top of whatever X-Plane (mouse, hat switch) already has.
-void applyOffsets(const Angles &target, const Vec3 &pos) {
-  float psi = XPLMGetDataf(gPsi), the = XPLMGetDataf(gThe), phi = XPLMGetDataf(gPhi);
-  XPLMSetDataf(gPsi, float(psi - gApplied.yaw + target.yaw));
-  XPLMSetDataf(gThe, float(the - gApplied.pitch + target.pitch));
-  XPLMSetDataf(gPhi, float(phi - gApplied.roll + target.roll));
-  gApplied = target;
+double wrap180(double a);
 
-  float x = XPLMGetDataf(gHeadX), y = XPLMGetDataf(gHeadY), z = XPLMGetDataf(gHeadZ);
-  XPLMSetDataf(gHeadX, float(x - gAppliedPos.x + pos.x));
-  XPLMSetDataf(gHeadY, float(y - gAppliedPos.y + pos.y));
-  XPLMSetDataf(gHeadZ, float(z - gAppliedPos.z + pos.z));
+// X-Plane's head = its base + whatever its camera effects add each frame (the
+// G-loaded camera wobbles the angles by ~0.1 deg). X-Plane takes whatever a
+// plugin writes as the new base and adds the next frame's wobble on top. So
+// writing back what we read would bake the wobble into the base every frame,
+// and its slight nose-down average made the view creep down (measured
+// 2026-11-04). Instead we keep the base ourselves: each frame we write
+// base + our offset + the wobble X-Plane just added (how far the head moved
+// since our last write). The G-loaded camera still shows; nothing builds up.
+// The user's own view moves (arrow keys, quick looks, hat, glances): X-Plane
+// ignores them while a plugin writes the head every frame (measured), so
+// while one of those commands runs we stop writing (gFollowUntil), and then
+// take the head as X-Plane left it as our new base.
+bool gHaveBase = false;
+double gBase[6], gWritten[6];  // psi, the, phi, x, y, z
+double gFollowUntil = 0;  // gliding moves: until then
+int gFollowFrames = 0;     // instant moves: for this many more frames
+bool gPausedForLook = false;
+
+void applyOffsets(const Angles &target, const Vec3 &pos) {
+  XPLMDataRef refs[6] = {gPsi, gThe, gPhi, gHeadX, gHeadY, gHeadZ};
+  double ours[6] = {target.yaw, target.pitch, target.roll, pos.x, pos.y, pos.z};
+  double applied[6] = {gApplied.yaw, gApplied.pitch, gApplied.roll, gAppliedPos.x, gAppliedPos.y, gAppliedPos.z};
+  for (int i = 0; i < 6; i++) {
+    double r = XPLMGetDataf(refs[i]), extra = 0;
+    if (!gHaveBase) {
+      gBase[i] = r - applied[i];
+    } else {
+      // How far X-Plane moved the head since our last write: its per-frame
+      // camera effect. Show it, don't keep it.
+      extra = r - gWritten[i];
+      if (i == 0) extra = wrap180(extra);
+    }
+    float w = float(gBase[i] + ours[i] + extra);
+    XPLMSetDataf(refs[i], w);
+    gWritten[i] = w;  // as X-Plane stores it, so float rounding isn't seen as movement
+  }
+  gHaveBase = true;
+  gApplied = target;
   gAppliedPos = pos;
 }
 
@@ -314,6 +342,7 @@ void removeOffsets() {
   bool applied = gApplied.yaw != 0 || gApplied.pitch != 0 || gApplied.roll != 0 ||
                  gAppliedPos.x != 0 || gAppliedPos.y != 0 || gAppliedPos.z != 0;
   if (applied) applyOffsets(Angles(), Vec3());
+  gHaveBase = false;  // X-Plane owns the head again
   gSmoothed = gSmoothedHead = Angles();
   gTorso = 0;
 }
@@ -333,6 +362,41 @@ std::vector<XPLMCommandRef> gViewCmds;
 int beforeViewCommand(XPLMCommandRef, XPLMCommandPhase phase, void *) {
   if (phase == xplm_CommandBegin) removeOffsets();
   return 1;  // let X-Plane carry on with the command
+}
+
+// Commands that move the head inside the cockpit. While one runs (and for a
+// moment after, as X-Plane glides the view), changes to the head are the
+// user's and go into our base instead of being treated as camera wobble.
+std::vector<std::string> lookCommandNames() {
+  std::vector<std::string> v = {
+      "sim/view/glance_left", "sim/view/glance_right", "sim/view/up_left", "sim/view/up_right",
+      "sim/view/straight_up", "sim/view/straight_down", "sim/view/left_45", "sim/view/right_45",
+      "sim/view/left_90", "sim/view/right_90", "sim/view/left_135", "sim/view/right_135",
+      "sim/view/back", "sim/view/rot_cockpit_left_45", "sim/view/rot_cockpit_right_45",
+      "sim/view/rot_cockpit_up_30", "sim/view/rot_cockpit_down_30", "sim/view/3d_cockpit_cmnd_look",
+      // W: our offsets come out first (it's also a view command), then X-Plane
+      // resets the head (instantly), which it only does while we don't write
+      "sim/view/default_view"};
+  for (int i = 0; i < 20; i++) v.push_back("sim/view/quick_look_" + std::to_string(i));
+  for (const char *d : {"left", "right", "up", "down", "forward", "backward"})
+    for (const char *sp : {"", "_fast", "_slow"}) v.push_back(std::string("sim/general/") + d + sp);
+  for (const char *d : {"up", "down", "left", "right"})
+    for (const char *sp : {"", "_fast", "_slow"}) v.push_back(std::string("sim/general/rot_") + d + sp);
+  for (const char *d : {"left", "right", "up", "down", "up_left", "up_right", "down_left", "down_right"})
+    v.push_back(std::string("sim/general/hat_switch_") + d);
+  return v;
+}
+std::vector<XPLMCommandRef> gLookCmds;
+
+bool gLogLookCmds = false;  // set by the head log, so it shows when look commands fire
+int beforeLookCommand(XPLMCommandRef, XPLMCommandPhase phase, void *glide) {
+  // Keep our hands off the head until a moment after the command ends, so
+  // X-Plane can finish moving: 1s for moves that may glide (quick looks,
+  // glances), a few frames for instant ones (arrow keys, W).
+  if (glide) gFollowUntil = std::fmax(gFollowUntil, XPLMGetElapsedTime() + 1.0);
+  else gFollowFrames = 3;
+  if (gLogLookCmds) debug("look command phase " + std::to_string(phase));
+  return 1;
 }
 
 double wrap180(double a) {
@@ -441,19 +505,6 @@ void updateCalibration(double now) {
 bool gWasInCockpit = false;
 bool gReleased = false;  // true while we leave the head datarefs alone
 
-// X-Plane's G-loaded camera pushes the head around every frame, and our
-// read-modify-write of the head datarefs bakes that push in, so the view
-// creeps (down, under normal G). While we write the head, hold X-Plane's
-// "suspend the G-loaded camera" command; let go once we stop. That leaves the
-// user's G-load camera setting itself alone.
-XPLMCommandRef gCmdGloadSuspend = nullptr;
-bool gGloadHeld = false;
-void holdGloadSuspend(bool hold) {
-  if (!gCmdGloadSuspend || hold == gGloadHeld) return;
-  if (hold) XPLMCommandBegin(gCmdGloadSuspend);
-  else XPLMCommandEnd(gCmdGloadSuspend);
-  gGloadHeld = hold;
-}
 
 float flightLoop(float elapsedSinceLastCall, float, int, void *) {
   std::string msg;
@@ -523,13 +574,24 @@ float flightLoop(float elapsedSinceLastCall, float, int, void *) {
     beta = 1.0 - std::exp(-double(elapsedSinceLastCall) * 1000.0 / gConfig.bodySmoothingMs);
   gTorso += (torsoTarget - gTorso) * beta;
 
-  if (inCockpit) {
+  bool lookPause = now < gFollowUntil || gFollowFrames > 0;
+  if (gFollowFrames > 0) gFollowFrames--;
+  if (inCockpit && lookPause) {
+    // You're moving the view with a key or quick look: let X-Plane do it.
+    // Our offsets (if any) stay in the head as X-Plane continues from our
+    // last write; after W they're already out.
+    gPausedForLook = true;
+  } else if (inCockpit) {
+    if (gPausedForLook) {
+      // Take the head as X-Plane left it (with our offsets still in it) as the new base.
+      gHaveBase = false;
+      gPausedForLook = false;
+    }
     Vec3 eye = eyeOffset(gSmoothedHead);
     bool settled = std::fabs(gSmoothed.yaw) < 0.01 && std::fabs(gSmoothed.pitch) < 0.01 &&
                    std::fabs(gSmoothed.roll) < 0.01 && std::fabs(eye.x) < 0.0001 &&
                    std::fabs(eye.y) < 0.0001 && std::fabs(eye.z) < 0.0001;
     if (tracking || !settled) {
-      holdGloadSuspend(true);
       applyOffsets(gSmoothed, eye);
       gReleased = false;
     } else if (!gReleased) {
@@ -540,14 +602,12 @@ float flightLoop(float elapsedSinceLastCall, float, int, void *) {
       // down). We write again as soon as tracking resumes.
       removeOffsets();
       gReleased = true;
-      holdGloadSuspend(false);
       debug("no tracking: view released to X-Plane");
     }
   } else if (gWasInCockpit) {
     // Leaving the 3D cockpit: take our offsets back out, so they aren't baked
     // into X-Plane's saved head position when you come back.
     removeOffsets();
-    holdGloadSuspend(false);
   } else {
     gSmoothed = gSmoothedHead = Angles();
     gTorso = 0;
@@ -588,6 +648,50 @@ bool requestRecenter() {
   bool ok = gLink && gLink->send(BleLink::kRecenter);
   debug(ok ? "recenter sent to the tracker" : "can't recenter: tracker not connected (or firmware too old)");
   return ok;
+}
+
+// Diagnostics: log X-Plane's head datarefs before and after the flight model
+// for 5s, to see at which point of the frame X-Plane's own camera effects
+// (the G-loaded camera) are included in them.
+XPLMFlightLoopID gHeadLogLoops[2] = {nullptr, nullptr};
+double gHeadLogUntil = 0;
+XPLMDataRef gGNrml = nullptr, gGloadCam = nullptr;
+float headLogLoop(float, float, int counter, void *phase) {
+  double now = XPLMGetElapsedTime();
+  if (now > gHeadLogUntil) {
+    if (phase == nullptr) debug("head log done"), gLogLookCmds = false;
+    return 0;  // stop
+  }
+  char b[512];
+  std::snprintf(b, sizeof(b),
+                "headlog %s t=%.3f frame=%d psi/the/phi %.4f/%.4f/%.4f xyz %.5f/%.5f/%.5f g %.3f gcam %d ours %s "
+                "follow %d base %.4f/%.4f/%.4f %.5f/%.5f/%.5f written %.4f/%.4f/%.4f %.5f/%.5f/%.5f",
+                phase ? "afterFM " : "beforeFM", now, counter, XPLMGetDataf(gPsi), XPLMGetDataf(gThe),
+                XPLMGetDataf(gPhi), XPLMGetDataf(gHeadX), XPLMGetDataf(gHeadY), XPLMGetDataf(gHeadZ),
+                gGNrml ? XPLMGetDataf(gGNrml) : 0.f, gGloadCam ? XPLMGetDatai(gGloadCam) : -1,
+                gReleased ? "released" : (gHaveBase ? "writing" : "nobase"),
+                (now < gFollowUntil || gFollowFrames > 0) ? 1 : 0,
+                gBase[0], gBase[1], gBase[2], gBase[3], gBase[4], gBase[5], gWritten[0], gWritten[1],
+                gWritten[2], gWritten[3], gWritten[4], gWritten[5]);
+  debug(b);
+  return -1;
+}
+
+void startHeadLog() {
+  if (!gGNrml) gGNrml = XPLMFindDataRef("sim/flightmodel/forces/g_nrml");
+  if (!gGloadCam) gGloadCam = XPLMFindDataRef("sim/graphics/view/gloaded_internal_cam");
+  for (int i = 0; i < 2; i++) {
+    if (!gHeadLogLoops[i]) {
+      XPLMCreateFlightLoop_t p{sizeof(p), i == 0 ? xplm_FlightLoop_Phase_BeforeFlightModel
+                                                 : xplm_FlightLoop_Phase_AfterFlightModel,
+                               headLogLoop, i == 0 ? nullptr : (void *)1};
+      gHeadLogLoops[i] = XPLMCreateFlightLoop(&p);
+    }
+    XPLMScheduleFlightLoop(gHeadLogLoops[i], -1.0f, 1);
+  }
+  gHeadLogUntil = XPLMGetElapsedTime() + 10.0;
+  gLogLookCmds = true;
+  debug("head log: 10s of head datarefs before/after the flight model");
 }
 
 bool mountCalibrated() { return gLink && gLink->connected() && (gLink->latest().flags & 0x02); }
@@ -788,8 +892,14 @@ PLUGIN_API int XPluginStart(char *outName, char *outSig, char *outDesc) {
   XPLMRegisterCommandHandler(gCmdCalibrate, handleCommand, 1, nullptr);
   XPLMRegisterCommandHandler(gCmdToggle, handleCommand, 1, nullptr);
   XPLMRegisterCommandHandler(gCmdSettings, handleCommand, 1, nullptr);
-  gCmdGloadSuspend = XPLMFindCommand("sim/view/g_loaded_camera_suspend");
-  if (!gCmdGloadSuspend) debug("no G-loaded camera suspend command; the view may creep with the G-load camera on");
+  for (const std::string &name : lookCommandNames())
+    if (XPLMCommandRef c = XPLMFindCommand(name.c_str())) {
+      // sim/view/* (quick looks, glances, 45/90 deg looks) may glide; sim/general/*
+      // moves step by step and W resets instantly
+      bool glide = name.rfind("sim/view/", 0) == 0 && name != "sim/view/default_view";
+      XPLMRegisterCommandHandler(c, beforeLookCommand, 1, glide ? (void *)1 : nullptr);
+      gLookCmds.push_back(c);
+    }
   for (const char *name : kViewCommands)
     if (XPLMCommandRef c = XPLMFindCommand(name)) {
       XPLMRegisterCommandHandler(c, beforeViewCommand, 1, nullptr);
@@ -807,6 +917,14 @@ PLUGIN_API void XPluginStop() {
   XPLMUnregisterCommandHandler(gCmdCalibrate, handleCommand, 1, nullptr);
   for (XPLMCommandRef c : gViewCmds) XPLMUnregisterCommandHandler(c, beforeViewCommand, 1, nullptr);
   gViewCmds.clear();
+  for (size_t i = 0; i < gLookCmds.size(); i++) {
+    // unregister with the same refcon it was registered with
+    XPLMUnregisterCommandHandler(gLookCmds[i], beforeLookCommand, 1, nullptr);
+    XPLMUnregisterCommandHandler(gLookCmds[i], beforeLookCommand, 1, (void *)1);
+  }
+  gLookCmds.clear();
+  for (XPLMFlightLoopID &l : gHeadLogLoops)
+    if (l) XPLMDestroyFlightLoop(l), l = nullptr;
   uiStop();
   if (!gRetiredLinks.empty()) debug("waiting for the Bluetooth thread to finish connecting");
   gRetiredLinks.clear();  // joins them
@@ -835,9 +953,9 @@ PLUGIN_API int XPluginEnable() {
 PLUGIN_API void XPluginDisable() {
   XPLMUnregisterFlightLoopCallback(flightLoop, nullptr);
   if (gWasInCockpit) removeOffsets();  // put the head back where it was
-  holdGloadSuspend(false);
   gApplied = gSmoothed = gSmoothedHead = Angles();
   gAppliedPos = Vec3();
+  gHaveBase = false;
   gTorso = 0;
   gWasInCockpit = false;
   // Stop the Bluetooth thread. Don't freeze the sim if it's stuck in a

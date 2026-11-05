@@ -47,6 +47,7 @@ bool linkAircraft(const std::string &name);        // "" unlinks
 // The tracker recenters and calibrates itself; these send it the command.
 // They return false if it isn't connected (or its firmware is too old).
 bool requestRecenter();
+void startHeadLog();        // log the head datarefs at both flight-loop phases for 5s (diagnostics)
 bool startCalibration();    // "look ahead, then nod down", guided by voice and calibrationText()
 bool resetMount();          // forget the calibration: board flat, +Y to the nose
 bool mountCalibrated();     // the connected tracker has a stored calibration
