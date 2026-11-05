@@ -1,0 +1,134 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1500" height="1180" viewBox="0 0 1500 1180" font-family="DejaVu Sans, Arial, sans-serif">
+  <rect width="1500" height="1180" fill="#ffffff"/>
+  <text x="750" y="60" text-anchor="middle" font-size="34" font-weight="bold" fill="#111">BNO085 → ESP32-C3 Super Mini wiring</text>
+  <text x="750" y="98" text-anchor="middle" font-size="19" fill="#555">I2C mode · both boards seen from the top (labels up, USB-C pointing up) · match pins by their printed labels</text>
+
+  <!-- ===== BNO085 board ===== -->
+  <rect x="170" y="210" width="270" height="460" rx="14" fill="#5b2a86" stroke="#3a1a57" stroke-width="3"/>
+  <text x="285" y="190" text-anchor="middle" font-size="24" font-weight="bold" fill="#111">BNO085 breakout</text>
+  <rect x="215" y="400" width="80" height="80" rx="6" fill="#222" stroke="#000"/>
+  <text x="255" y="446" text-anchor="middle" font-size="15" fill="#ddd">BNO085</text>
+  <g font-size="19" font-weight="bold" fill="#fff" text-anchor="end">
+    <text x="400" y="266">PS1</text>
+    <text x="400" y="306">PS0</text>
+    <text x="400" y="346">GND</text>
+    <text x="400" y="386">VCC</text>
+    <text x="400" y="426">INT</text>
+    <text x="400" y="466">RST</text>
+    <text x="400" y="506">SCL</text>
+    <text x="400" y="546">SDA</text>
+    <text x="400" y="586" fill="#bba8d0">ADO</text>
+    <text x="400" y="626" fill="#bba8d0">CS</text>
+  </g>
+  <g fill="#e8c35a" stroke="#8a6d1d" stroke-width="2">
+    <circle cx="420" cy="260" r="9"/><circle cx="420" cy="300" r="9"/><circle cx="420" cy="340" r="9"/>
+    <circle cx="420" cy="380" r="9"/><circle cx="420" cy="420" r="9"/><circle cx="420" cy="460" r="9"/>
+    <circle cx="420" cy="500" r="9"/><circle cx="420" cy="540" r="9"/><circle cx="420" cy="580" r="9"/>
+    <circle cx="420" cy="620" r="9"/>
+  </g>
+  <text x="330" y="586" font-size="15" fill="#bba8d0" text-anchor="end">(n/c)</text>
+  <text x="330" y="626" font-size="15" fill="#bba8d0" text-anchor="end">(n/c)</text>
+  <text x="305" y="700" text-anchor="middle" font-size="15" fill="#666">Adafruit board: VCC = "Vin", PS0/PS1 = "P0"/"P1"</text>
+
+  <!-- ===== ESP32-C3 Super Mini ===== -->
+  <rect x="975" y="180" width="90" height="56" rx="10" fill="#b8b8b8" stroke="#666" stroke-width="2"/>
+  <text x="1020" y="215" text-anchor="middle" font-size="15" fill="#333">USB-C</text>
+  <rect x="880" y="225" width="240" height="445" rx="14" fill="#1d4f91" stroke="#123461" stroke-width="3"/>
+  <text x="1000" y="160" text-anchor="middle" font-size="24" font-weight="bold" fill="#111">ESP32-C3 Super Mini</text>
+  <rect x="968" y="612" width="64" height="44" rx="4" fill="#ccc" stroke="#777"/>
+  <text x="1000" y="639" text-anchor="middle" font-size="12" fill="#333">C3</text>
+  <rect x="912" y="618" width="48" height="26" rx="4" fill="#eee" stroke="#555"/>
+  <text x="936" y="636" text-anchor="middle" font-size="12" fill="#111">BOOT</text>
+  <rect x="1040" y="618" width="48" height="26" rx="4" fill="#eee" stroke="#555"/>
+  <text x="1064" y="636" text-anchor="middle" font-size="12" fill="#111">RST</text>
+  <g font-size="18" font-weight="bold" fill="#fff">
+    <text x="918" y="276" fill="#9fb6d6">5V</text>
+    <text x="918" y="322">GND</text>
+    <text x="918" y="368">3V3</text>
+    <text x="918" y="414">4</text>
+    <text x="918" y="460" fill="#9fb6d6">3</text>
+    <text x="918" y="506" fill="#9fb6d6">2</text>
+    <text x="918" y="552" fill="#9fb6d6">1</text>
+    <text x="918" y="598" fill="#9fb6d6">0</text>
+  </g>
+  <g font-size="18" font-weight="bold" fill="#fff" text-anchor="end">
+    <text x="1082" y="322">6</text>
+    <text x="1082" y="368" fill="#9fb6d6">7</text>
+    <text x="1082" y="414" fill="#9fb6d6">8</text>
+    <text x="1082" y="460" fill="#9fb6d6">9</text>
+    <text x="1082" y="506">10</text>
+    <text x="1082" y="552" fill="#9fb6d6">20</text>
+    <text x="1082" y="598" fill="#9fb6d6">21</text>
+  </g>
+  <text x="1082" y="276" font-size="18" font-weight="bold" fill="#fff" text-anchor="end">5</text>
+  <g fill="#e8c35a" stroke="#8a6d1d" stroke-width="2">
+    <circle cx="898" cy="270" r="9"/><circle cx="898" cy="316" r="9"/><circle cx="898" cy="362" r="9"/>
+    <circle cx="898" cy="408" r="9"/><circle cx="898" cy="454" r="9"/><circle cx="898" cy="500" r="9"/>
+    <circle cx="898" cy="546" r="9"/><circle cx="898" cy="592" r="9"/>
+    <circle cx="1102" cy="270" r="9"/>
+  </g>
+  <g fill="#e8c35a" stroke="#8a6d1d" stroke-width="2">
+    <circle cx="1102" cy="316" r="9"/><circle cx="1102" cy="362" r="9"/><circle cx="1102" cy="408" r="9"/>
+    <circle cx="1102" cy="454" r="9"/><circle cx="1102" cy="500" r="9"/><circle cx="1102" cy="546" r="9"/>
+    <circle cx="1102" cy="592" r="9"/>
+  </g>
+  <!-- side notes on the C3 -->
+  
+
+  <!-- ===== wires ===== -->
+  <g fill="none" stroke-width="7" stroke-linecap="round" stroke-linejoin="round">
+    <!-- PS1, PS0 jumpers to GND -->
+    <path d="M420,260 H470 V340" stroke="#222"/>
+    <path d="M420,300 H470" stroke="#222"/>
+    <!-- GND -->
+    <path d="M420,340 H650 V316 H898" stroke="#222"/>
+    <!-- VCC to 3V3 -->
+    <path d="M420,380 H690 V362 H898" stroke="#d62728"/>
+    <!-- INT to GPIO4 -->
+    <path d="M420,420 H730 V408 H898" stroke="#2ca02c"/>
+    <!-- RST to GPIO10 -->
+    <path d="M420,460 H570 V730 H1190 V500 H1102" stroke="#e67e22"/>
+    <!-- SCL to GPIO6 -->
+    <path d="M420,500 H535 V775 H1240 V316 H1102" stroke="#e0b000"/>
+    <!-- SDA to GPIO5 -->
+    <path d="M420,540 H500 V820 H1290 V270 H1102" stroke="#1f6fd1"/>
+  </g>
+  <circle cx="470" cy="300" r="7" fill="#222"/>
+  <circle cx="470" cy="340" r="7" fill="#222"/>
+  <!-- wire labels -->
+  <g font-size="17" font-weight="bold">
+    <text x="745" y="308" fill="#222">GND</text>
+    <text x="745" y="354" fill="#d62728">3.3 V</text>
+    <text x="745" y="400" fill="#2ca02c">INT → GPIO4</text>
+    <text x="745" y="722" fill="#e67e22">RST → GPIO10</text>
+    <text x="745" y="767" fill="#b08800">SCL → GPIO6</text>
+    <text x="745" y="812" fill="#1f6fd1">SDA → GPIO5</text>
+    <text x="478" y="285" fill="#222" font-size="14">PS0 + PS1 to GND</text>
+  </g>
+
+  <!-- ===== table ===== -->
+  <g font-size="19">
+    <rect x="80" y="880" width="760" height="270" rx="10" fill="#f6f6f6" stroke="#ccc"/>
+    <text x="110" y="917" font-weight="bold" fill="#111">BNO085</text>
+    <text x="270" y="917" font-weight="bold" fill="#111">ESP32-C3</text>
+    <text x="430" y="917" font-weight="bold" fill="#111">Note</text>
+    <line x1="100" y1="928" x2="820" y2="928" stroke="#bbb"/>
+    <text x="110" y="955">VCC</text><text x="270" y="955">3V3</text><text x="430" y="955" fill="#555">3.3 V, not 5V</text>
+    <text x="110" y="983">GND</text><text x="270" y="983">GND</text>
+    <text x="110" y="1011">SDA</text><text x="270" y="1011">GPIO5</text>
+    <text x="110" y="1039">SCL</text><text x="270" y="1039">GPIO6</text>
+    <text x="110" y="1067">INT</text><text x="270" y="1067">GPIO4</text><text x="430" y="1067" fill="#555">optional, best battery life</text>
+    <text x="110" y="1095">RST</text><text x="270" y="1095">GPIO10</text><text x="430" y="1095" fill="#555">recommended (auto sensor restart)</text>
+    <text x="110" y="1123">PS0, PS1</text><text x="270" y="1123">GND</text><text x="430" y="1123" fill="#555">I2C mode; skip if board pulls low</text>
+  </g>
+  <g font-size="17" fill="#333">
+    <text x="880" y="905" font-weight="bold" font-size="19" fill="#111">Notes</text>
+    <text x="880" y="940">• ADO and CS: leave unconnected</text>
+    <text x="880" y="966">  (firmware finds address 0x4A or 0x4B)</text>
+    <text x="880" y="1000">• Pin order on your BNO board may differ:</text>
+    <text x="880" y="1026">  go by the printed labels</text>
+    <text x="880" y="1060">• C3 BOOT button (GPIO9) = recenter;</text>
+    <text x="880" y="1086">  GPIO8 = onboard LED</text>
+    <text x="880" y="1120">• M5Stack Core stand-in: no wiring needed</text>
+  </g>
+</svg>
