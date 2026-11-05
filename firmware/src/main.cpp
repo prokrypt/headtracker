@@ -73,6 +73,7 @@
 #include <esp_sleep.h>
 #if IMU_MPU6886
 #include <driver/dac_common.h>
+#include <driver/rmt.h>
 #include <esp_timer.h>
 #endif
 #if CONFIG_PM_ENABLE
@@ -293,7 +294,7 @@ static void forgetMagCal();
 // (full 3.3V edges), so this is a soft 1kHz sine from the DAC at a tiny
 // amplitude, with 20ms fades so it doesn't click. Samples come from a 16kHz
 // esp_timer for 150ms; the main loop keeps running.
-static const uint8_t BLIP_AMPLITUDE = 2;  // DAC counts of 255 (3.3V): peak-to-peak = 2x this
+static const uint8_t BLIP_AMPLITUDE = 8;  // DAC counts of 255 (3.3V), peak-to-peak = 2x this; 8 picked by ear (user)
 static const uint32_t BLIP_RATE = 16000, BLIP_MS = 150, BLIP_FADE_MS = 20;
 static const int8_t kSine16[16] = {0, 49, 90, 117, 127, 117, 90, 49, 0, -49, -90, -117, -127, -117, -90, -49};
 static esp_timer_handle_t blipTimer = nullptr;
@@ -626,7 +627,48 @@ static uint32_t updateLed(bool connected) {
 
 #if IMU_MPU6886
 // ---- LED bar (M5GO/Fire base): short, dim animations, dark otherwise ----
-static Adafruit_NeoPixel strip(NUM_LEDS, PIN_LEDBAR, NEO_GRB + NEO_KHZ800);
+// Our own RMT sender instead of Adafruit_NeoPixel::show(). On IDF 4 that one
+// gives the RMT a single 64-bit memory block (2.7 LEDs) and refills it from an
+// interrupt as it goes; an interrupt more than ~40us late (BLE, I2C, the 80MHz
+// clock) stalls the line, the LEDs latch, and the rest of the frame starts
+// over at LED 0 shifted by a byte: the middle LEDs' blue showed up as red on
+// the left end. Here the whole frame (240 bits + end marker) fits in four RMT
+// blocks, so it goes out in one piece whatever the interrupts do.
+// Adafruit_NeoPixel stays for its Color()/ColorHSV() helpers.
+class LedBar {
+ public:
+  void begin() {
+    rmt_config_t c = RMT_DEFAULT_CONFIG_TX((gpio_num_t)PIN_LEDBAR, kChannel);
+    c.clk_div = 2;          // 40MHz: 25ns ticks
+    c.mem_block_num = 4;    // 256 items, channels 1-3 lend theirs
+    ok_ = rmt_config(&c) == ESP_OK && rmt_driver_install(kChannel, 0, 0) == ESP_OK;
+    if (!ok_) Serial.println("LED bar: RMT setup failed");
+  }
+  void setPixelColor(int i, uint32_t c) { if (i >= 0 && i < NUM_LEDS) px_[i] = c; }
+  void clear() { memset(px_, 0, sizeof(px_)); }
+  void show() {
+    if (!ok_) return;
+    // SK6812/WS2812 at 800kHz, GRB order, MSB first (same timings as Adafruit's).
+    const rmt_item32_t bit0 = {{{16, 1, 34, 0}}};  // 0.40us high, 0.85us low
+    const rmt_item32_t bit1 = {{{32, 1, 18, 0}}};  // 0.80us high, 0.45us low
+    size_t n = 0;
+    for (int i = 0; i < NUM_LEDS; ++i) {
+      uint32_t c = px_[i];
+      uint32_t grb = ((c >> 8) & 0xFF) << 16 | ((c >> 16) & 0xFF) << 8 | (c & 0xFF);
+      for (int b = 23; b >= 0; --b) items_[n++] = (grb >> b) & 1 ? bit1 : bit0;
+    }
+    items_[n++] = rmt_item32_t{};  // end marker
+    rmt_write_items(kChannel, items_, n, true);  // ~0.3ms, waits until sent
+  }
+
+ private:
+  static constexpr rmt_channel_t kChannel = RMT_CHANNEL_0;
+  uint32_t px_[NUM_LEDS] = {};
+  rmt_item32_t items_[NUM_LEDS * 24 + 1];
+  bool ok_ = false;
+};
+static_assert(NUM_LEDS * 24 + 1 <= 4 * 64, "LED frame must fit the RMT blocks");
+static LedBar strip;
 static Anim anim = Anim::None;
 static uint32_t animStart = 0;
 static uint32_t ledFrame[NUM_LEDS];
