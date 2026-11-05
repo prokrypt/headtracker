@@ -18,6 +18,9 @@ endif()
 include(FetchContent)
 set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+# Otherwise `cmake --install` also copies SimpleBLE's headers and static lib
+# into Resources/plugins/{include,lib64}.
+set(SIMPLEBLE_INSTALL OFF CACHE BOOL "" FORCE)
 FetchContent_Declare(simpleble
   GIT_REPOSITORY https://github.com/simpleble/simpleble.git
   GIT_TAG v1.4.0
