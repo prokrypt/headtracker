@@ -418,6 +418,7 @@ void updateCalibration(double now) {
 }
 
 bool gWasInCockpit = false;
+bool gReleased = false;  // true while we leave the head datarefs alone
 
 float flightLoop(float elapsedSinceLastCall, float, int, void *) {
   std::string msg;
@@ -444,7 +445,8 @@ float flightLoop(float elapsedSinceLastCall, float, int, void *) {
   // how it's mounted. Older firmware can't do that, so it's not used.
   Angles target, head;  // zero = no offset
   bool inCockpit = XPLMGetDatai(gViewType) == kView3dCockpit;
-  if (gEnabled && fresh && gLink->canCommand() && inCockpit) {
+  bool tracking = gEnabled && fresh && gLink->canCommand() && inCockpit;
+  if (tracking) {
     Angles a = s.head;
     head = a;
     target.yaw = shape(a.yaw, gConfig.gainYaw, gConfig.invertYaw, gConfig.maxYaw);
@@ -487,7 +489,23 @@ float flightLoop(float elapsedSinceLastCall, float, int, void *) {
   gTorso += (torsoTarget - gTorso) * beta;
 
   if (inCockpit) {
-    applyOffsets(gSmoothed, eyeOffset(gSmoothedHead));
+    Vec3 eye = eyeOffset(gSmoothedHead);
+    bool settled = std::fabs(gSmoothed.yaw) < 0.01 && std::fabs(gSmoothed.pitch) < 0.01 &&
+                   std::fabs(gSmoothed.roll) < 0.01 && std::fabs(eye.x) < 0.0001 &&
+                   std::fabs(eye.y) < 0.0001 && std::fabs(eye.z) < 0.0001;
+    if (tracking || !settled) {
+      applyOffsets(gSmoothed, eye);
+      gReleased = false;
+    } else if (!gReleased) {
+      // No tracker (or tracking off) and our offsets have eased back to zero:
+      // take them out exactly, then stop writing the head datarefs. Writing
+      // them back every frame fights X-Plane's own camera effects (the
+      // G-load camera's push got baked in each frame and the view crept
+      // down). We write again as soon as tracking resumes.
+      removeOffsets();
+      gReleased = true;
+      debug("no tracking: view released to X-Plane");
+    }
   } else if (gWasInCockpit) {
     // Leaving the 3D cockpit: take our offsets back out, so they aren't baked
     // into X-Plane's saved head position when you come back.
