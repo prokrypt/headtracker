@@ -441,6 +441,20 @@ void updateCalibration(double now) {
 bool gWasInCockpit = false;
 bool gReleased = false;  // true while we leave the head datarefs alone
 
+// X-Plane's G-loaded camera pushes the head around every frame, and our
+// read-modify-write of the head datarefs bakes that push in, so the view
+// creeps (down, under normal G). While we write the head, hold X-Plane's
+// "suspend the G-loaded camera" command; let go once we stop. That leaves the
+// user's G-load camera setting itself alone.
+XPLMCommandRef gCmdGloadSuspend = nullptr;
+bool gGloadHeld = false;
+void holdGloadSuspend(bool hold) {
+  if (!gCmdGloadSuspend || hold == gGloadHeld) return;
+  if (hold) XPLMCommandBegin(gCmdGloadSuspend);
+  else XPLMCommandEnd(gCmdGloadSuspend);
+  gGloadHeld = hold;
+}
+
 float flightLoop(float elapsedSinceLastCall, float, int, void *) {
   std::string msg;
   while (gLink && gLink->popLog(msg)) debug(msg);
@@ -515,6 +529,7 @@ float flightLoop(float elapsedSinceLastCall, float, int, void *) {
                    std::fabs(gSmoothed.roll) < 0.01 && std::fabs(eye.x) < 0.0001 &&
                    std::fabs(eye.y) < 0.0001 && std::fabs(eye.z) < 0.0001;
     if (tracking || !settled) {
+      holdGloadSuspend(true);
       applyOffsets(gSmoothed, eye);
       gReleased = false;
     } else if (!gReleased) {
@@ -525,12 +540,14 @@ float flightLoop(float elapsedSinceLastCall, float, int, void *) {
       // down). We write again as soon as tracking resumes.
       removeOffsets();
       gReleased = true;
+      holdGloadSuspend(false);
       debug("no tracking: view released to X-Plane");
     }
   } else if (gWasInCockpit) {
     // Leaving the 3D cockpit: take our offsets back out, so they aren't baked
     // into X-Plane's saved head position when you come back.
     removeOffsets();
+    holdGloadSuspend(false);
   } else {
     gSmoothed = gSmoothedHead = Angles();
     gTorso = 0;
@@ -771,6 +788,8 @@ PLUGIN_API int XPluginStart(char *outName, char *outSig, char *outDesc) {
   XPLMRegisterCommandHandler(gCmdCalibrate, handleCommand, 1, nullptr);
   XPLMRegisterCommandHandler(gCmdToggle, handleCommand, 1, nullptr);
   XPLMRegisterCommandHandler(gCmdSettings, handleCommand, 1, nullptr);
+  gCmdGloadSuspend = XPLMFindCommand("sim/view/g_loaded_camera_suspend");
+  if (!gCmdGloadSuspend) debug("no G-loaded camera suspend command; the view may creep with the G-load camera on");
   for (const char *name : kViewCommands)
     if (XPLMCommandRef c = XPLMFindCommand(name)) {
       XPLMRegisterCommandHandler(c, beforeViewCommand, 1, nullptr);
@@ -816,6 +835,7 @@ PLUGIN_API int XPluginEnable() {
 PLUGIN_API void XPluginDisable() {
   XPLMUnregisterFlightLoopCallback(flightLoop, nullptr);
   if (gWasInCockpit) removeOffsets();  // put the head back where it was
+  holdGloadSuspend(false);
   gApplied = gSmoothed = gSmoothedHead = Angles();
   gAppliedPos = Vec3();
   gTorso = 0;
