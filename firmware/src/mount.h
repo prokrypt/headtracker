@@ -90,6 +90,7 @@ enum CalResult : uint8_t {
   CAL_MAG_FIT = 7,      // readings don't fit one steady field (something magnetic nearby moved?)
   CAL_MAG_AXES = 8,     // couldn't match the compass axes to the gyro (turn it more)
   CAL_NO_MAG = 9,       // no magnetometer (or the sensor isn't running)
+  CAL_BUSY = 10,        // blip: one is still playing (or the timer couldn't be made)
 };
 
 static const float kMinNodDeg = 15.0f;

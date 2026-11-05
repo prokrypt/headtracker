@@ -317,13 +317,18 @@ static void blipTick(void *) {
   dac_output_voltage(DAC_CHANNEL_1, (uint8_t)(v + 0.5f));
 }
 
-static void blipStart(uint8_t amp) {
-  if (blipRunning || amp == 0) return;
+static void blipStop(bool now);
+
+// Returns false (nothing plays) if a blip is still playing or the timer
+// couldn't be made.
+static bool blipStart(uint8_t amp) {
+  blipStop(false);  // a finished blip the main loop hasn't tidied up yet
+  if (blipRunning || amp == 0) return false;
   if (!blipTimer) {
     esp_timer_create_args_t a = {};
     a.callback = blipTick;
     a.name = "blip";
-    if (esp_timer_create(&a, &blipTimer) != ESP_OK) return;
+    if (esp_timer_create(&a, &blipTimer) != ESP_OK) return false;
   }
   blipAmp = amp;
   blipN = 0;
@@ -332,6 +337,7 @@ static void blipStart(uint8_t amp) {
   dac_output_enable(DAC_CHANNEL_1);  // pin was a digital low: same 0V, no click
   blipRunning = true;
   esp_timer_start_periodic(blipTimer, 1000000 / BLIP_RATE);
+  return true;
 }
 
 // Back to a plain digital low once a blip is done (or at once, before power off).
@@ -355,11 +361,6 @@ static void handleCommand(uint8_t cmd) {
     case CMD_MAG_RESET:
       forgetMagCal();
       reply(cmd, CAL_OK);
-      break;
-    case CMD_BLIP:
-      blipStart(BLIP_AMPLITUDE);
-      reply(cmd, CAL_OK);
-      Serial.printf("Blip, amplitude %u\n", BLIP_AMPLITUDE);
       break;
 #endif
     case CMD_RECENTER:
@@ -405,10 +406,12 @@ static void handleCommand(uint8_t cmd) {
       break;
     default:
 #if IMU_MPU6886
-      if (cmd > CMD_BLIP_LEVEL && cmd <= CMD_BLIP_LEVEL + 15) {
-        blipStart(cmd - CMD_BLIP_LEVEL);
-        reply(cmd, CAL_OK);
-        Serial.printf("Blip, amplitude %u\n", cmd - CMD_BLIP_LEVEL);
+      // 07 = blip at the built-in volume, 71..7F = blip at amplitude 1..15
+      if (cmd == CMD_BLIP || (cmd > CMD_BLIP_LEVEL && cmd <= CMD_BLIP_LEVEL + 15)) {
+        uint8_t amp = cmd == CMD_BLIP ? BLIP_AMPLITUDE : cmd - CMD_BLIP_LEVEL;
+        bool ok = blipStart(amp);
+        reply(cmd, ok ? CAL_OK : CAL_BUSY);
+        Serial.printf(ok ? "Blip, amplitude %u\n" : "Blip at amplitude %u skipped: one is still playing\n", amp);
       }
 #endif
       break;
@@ -453,6 +456,12 @@ static void setupPower() {
   esp_pm_lock_acquire(usbLock);  // until we know whether a computer is attached
   usbLockHeld = true;
 #else
+#if IMU_MPU6886
+  // sdkconfig.defaults asks for 80MHz, but a sdkconfig.m5core generated before
+  // that keeps its old clock. The peripheral clock is 80MHz at any CPU clock
+  // of 80MHz or more, so switching here changes nothing for UART, I2C or RMT.
+  if (getCpuFrequencyMhz() != 80) setCpuFrequencyMhz(80);
+#endif
   Serial.printf("Power: no light sleep on this build, CPU %uMHz\n", (unsigned)getCpuFrequencyMhz());
 #endif
 }
@@ -762,9 +771,7 @@ static void updateLeds(bool waiting, float calProgress) {
   ledsDirty = false;
 }
 
-// IP5306 power chip, SYS_CTL0 bit1: keep the 5V boost on even at light load.
-// Off, it cuts the board's power ~30s after the load drops (that's how we
-// power off on battery: deep sleep draws next to nothing).
+// IP5306 power chip (I2C 0x75): read one register.
 static bool ip5306Read(uint8_t reg, uint8_t &v) {
   Wire.beginTransmission(0x75);
   Wire.write(reg);
@@ -812,17 +819,19 @@ static void batteryBlips() {
   if (battery == Battery::Ok) { last = battery; return; }
   uint32_t period = battery == Battery::Empty ? 10000 : 300000;
   if (battery != last || millis() - lastBlip >= period) {
-    blipStart(BLIP_AMPLITUDE);
-    lastBlip = millis();
-    last = battery;
+    if (blipStart(BLIP_AMPLITUDE)) {  // a test blip still playing: try again next loop
+      lastBlip = millis();
+      last = battery;
+    }
   }
 }
 
+// IP5306 SYS_CTL0 bit1: keep the 5V boost on even at light load.
+// Off, it cuts the board's power ~30s after the load drops (that's how we
+// power off on battery: deep sleep draws next to nothing).
 static void ip5306KeepOn(bool on) {
-  Wire.beginTransmission(0x75);
-  Wire.write(0x00);
-  if (Wire.endTransmission(false) != 0 || Wire.requestFrom(0x75, 1) != 1) return;
-  uint8_t v = Wire.read();
+  uint8_t v;
+  if (!ip5306Read(0x00, v)) return;
   v = on ? (v | 0x02) : (v & ~0x02);
   Wire.beginTransmission(0x75);
   Wire.write(0x00);

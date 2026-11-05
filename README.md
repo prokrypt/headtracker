@@ -36,7 +36,7 @@ pio device monitor       # then press RESET: it prints "BLE advertising" and "BN
 
 Also install PlatformIO's udev rules once (https://docs.platformio.org/en/latest/core/installation/udev-rules.html). Pressing RESET drops the C3's USB port for a moment, so you may have to start `pio device monitor` again after it.
 The first build takes a few minutes, because it compiles ESP-IDF itself (needed for light sleep). Later builds are quick.
-If you change `sdkconfig.defaults` (or got a new copy of it), delete `firmware/sdkconfig.esp32c3` first. PlatformIO only reads the defaults when that file doesn't exist yet.
+If you change `sdkconfig.defaults` (or got a new copy of it), delete the generated `firmware/sdkconfig.<env>` files first (`sdkconfig.esp32c3`, `sdkconfig.esp32c3-fake`, `sdkconfig.m5core`). PlatformIO only reads the defaults when that file doesn't exist yet.
 Flash over USB once like this. After that you can update over Bluetooth (section 5).
 The first USB flash has to be `pio run -t upload`, because it also writes the bootloader and the partition table. `builds/firmware.bin` on its own is only for Bluetooth updates.
 
