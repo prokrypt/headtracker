@@ -22,6 +22,8 @@
 //   05  compass calibration (M5Stack build): turn the tracker every way for
 //       20s, the reply comes at the end (button B does the same)
 //   06  forget the compass calibration (M5Stack build)
+//   07  play the low-battery blip on the speaker (M5Stack build, for testing)
+//   71..7F  the same blip at DAC amplitude 1..15, to find a bearable volume
 // Reply (notify): <u8 command> <u8 result>, result 0 = OK, see CalResult in mount.h.
 //
 // The tracker recenters by itself when the sensor (re)starts (after it slept
@@ -50,7 +52,8 @@
 // connection (red button or button A turns it back on). With the M5GO/Fire
 // base fitted, its LED bar shows power on/off and connection changes briefly,
 // and blinks red at both ends when the battery is down to its last gauge step
-// (about 25%; the whole bar when nearly empty). No light sleep on that board
+// (about 25%; the whole bar when nearly empty). The speaker gives a quiet blip
+// then too: every 5 minutes when low, every 10s when nearly empty. No light sleep on that board
 // (no 32kHz crystal for BLE); it runs at a fixed 80MHz and sends at 0dBm instead.
 
 #include <Arduino.h>
@@ -68,6 +71,10 @@
 #include <Preferences.h>
 #include <driver/gpio.h>
 #include <esp_sleep.h>
+#if IMU_MPU6886
+#include <driver/dac_common.h>
+#include <esp_timer.h>
+#endif
 #if CONFIG_PM_ENABLE
 #include <esp_pm.h>
 #endif
@@ -119,7 +126,8 @@ static const char *CTRL_CHAR_UUID = "6e7a0003-3c1b-4b8a-9f2e-6b1d5a7c0de1";
 
 enum : uint8_t {
   CMD_RECENTER = 0x01, CMD_CAL_AHEAD = 0x02, CMD_CAL_NOD = 0x03, CMD_CAL_RESET = 0x04,
-  CMD_MAG_CAL = 0x05, CMD_MAG_RESET = 0x06,
+  CMD_MAG_CAL = 0x05, CMD_MAG_RESET = 0x06, CMD_BLIP = 0x07,
+  CMD_BLIP_LEVEL = 0x70,  // 0x71..0x7F: blip at amplitude 1..15
 };
 
 // Advertise slowly while idle (units of 0.625 ms): about 0.5 s between beacons.
@@ -278,6 +286,65 @@ static void startMagCal();
 static void forgetMagCal();
 #endif
 
+#if IMU_MPU6886
+// ---- Speaker blip (low-battery reminder) ----
+// The speaker amp (GPIO25 = DAC1 into it) is always powered on this board, so
+// a blip costs nothing extra. PWM beeps were painfully loud even at 4% duty
+// (full 3.3V edges), so this is a soft 1kHz sine from the DAC at a tiny
+// amplitude, with 20ms fades so it doesn't click. Samples come from a 16kHz
+// esp_timer for 150ms; the main loop keeps running.
+static const uint8_t BLIP_AMPLITUDE = 2;  // DAC counts of 255 (3.3V): peak-to-peak = 2x this
+static const uint32_t BLIP_RATE = 16000, BLIP_MS = 150, BLIP_FADE_MS = 20;
+static const int8_t kSine16[16] = {0, 49, 90, 117, 127, 117, 90, 49, 0, -49, -90, -117, -127, -117, -90, -49};
+static esp_timer_handle_t blipTimer = nullptr;
+static volatile bool blipRunning = false, blipFinished = false;
+static volatile uint32_t blipN = 0;
+static volatile uint8_t blipAmp = 0;
+
+static void blipTick(void *) {
+  const uint32_t total = BLIP_RATE * BLIP_MS / 1000, fade = BLIP_RATE * BLIP_FADE_MS / 1000;
+  uint32_t n = blipN++;
+  if (n >= total) {
+    esp_timer_stop(blipTimer);
+    dac_output_voltage(DAC_CHANNEL_1, 0);
+    blipFinished = true;
+    return;
+  }
+  float env = fminf(1.0f, fminf((float)n / fade, (float)(total - n) / fade));
+  // 0..2*amp, starting and ending at 0V (where the pin sits between blips)
+  float v = blipAmp * env * (1.0f + kSine16[n % 16] / 127.0f);
+  dac_output_voltage(DAC_CHANNEL_1, (uint8_t)(v + 0.5f));
+}
+
+static void blipStart(uint8_t amp) {
+  if (blipRunning || amp == 0) return;
+  if (!blipTimer) {
+    esp_timer_create_args_t a = {};
+    a.callback = blipTick;
+    a.name = "blip";
+    if (esp_timer_create(&a, &blipTimer) != ESP_OK) return;
+  }
+  blipAmp = amp;
+  blipN = 0;
+  blipFinished = false;
+  dac_output_voltage(DAC_CHANNEL_1, 0);
+  dac_output_enable(DAC_CHANNEL_1);  // pin was a digital low: same 0V, no click
+  blipRunning = true;
+  esp_timer_start_periodic(blipTimer, 1000000 / BLIP_RATE);
+}
+
+// Back to a plain digital low once a blip is done (or at once, before power off).
+static void blipStop(bool now) {
+  if (!blipRunning || (!now && !blipFinished)) return;
+  if (now) esp_timer_stop(blipTimer);
+  dac_output_voltage(DAC_CHANNEL_1, 0);
+  dac_output_disable(DAC_CHANNEL_1);
+  pinMode(PIN_SPEAKER, OUTPUT);
+  digitalWrite(PIN_SPEAKER, LOW);
+  blipRunning = false;
+}
+#endif
+
 static void handleCommand(uint8_t cmd) {
   switch (cmd) {
 #if IMU_MPU6886
@@ -287,6 +354,11 @@ static void handleCommand(uint8_t cmd) {
     case CMD_MAG_RESET:
       forgetMagCal();
       reply(cmd, CAL_OK);
+      break;
+    case CMD_BLIP:
+      blipStart(BLIP_AMPLITUDE);
+      reply(cmd, CAL_OK);
+      Serial.printf("Blip, amplitude %u\n", BLIP_AMPLITUDE);
       break;
 #endif
     case CMD_RECENTER:
@@ -331,6 +403,13 @@ static void handleCommand(uint8_t cmd) {
       Serial.println("Calibration reset to default mount");
       break;
     default:
+#if IMU_MPU6886
+      if (cmd > CMD_BLIP_LEVEL && cmd <= CMD_BLIP_LEVEL + 15) {
+        blipStart(cmd - CMD_BLIP_LEVEL);
+        reply(cmd, CAL_OK);
+        Serial.printf("Blip, amplitude %u\n", cmd - CMD_BLIP_LEVEL);
+      }
+#endif
       break;
   }
 }
@@ -681,6 +760,20 @@ static void updateBattery() {
   battery = b;
 }
 
+// Speaker reminder while the battery warning is on: a blip right away, then
+// every 5 minutes while low, every 10s once nearly empty.
+static void batteryBlips() {
+  static Battery last = Battery::Ok;
+  static uint32_t lastBlip = 0;
+  if (battery == Battery::Ok) { last = battery; return; }
+  uint32_t period = battery == Battery::Empty ? 10000 : 300000;
+  if (battery != last || millis() - lastBlip >= period) {
+    blipStart(BLIP_AMPLITUDE);
+    lastBlip = millis();
+    last = battery;
+  }
+}
+
 static void ip5306KeepOn(bool on) {
   Wire.beginTransmission(0x75);
   Wire.write(0x00);
@@ -766,6 +859,7 @@ static void updateMag() {
 // ---- Power off ----
 static void powerOff(const char *why) {
   Serial.printf("Powering off: %s\n", why);
+  blipStop(true);
   if (fusion.biasChanged) saveBias();
   imu.sleep(true);
   bmm.suspend();
@@ -798,6 +892,8 @@ static void m5Housekeeping() {
   wasConnected = connected;
   float calProgress = magCalibrator.active ? fminf(1.0f, magCalibrator.elapsedMs() / (float)MagCalibrator::kDurationMs) : -1.0f;
   updateBattery();
+  batteryBlips();
+  blipStop(false);
   updateLeds(!connected, calProgress);
   static uint8_t bCount = 0;
   static bool bWas = false;
