@@ -5,3 +5,4 @@ build/
 builds/
 __pycache__/
 .venv/
+firmware/sdkconfig.m5core

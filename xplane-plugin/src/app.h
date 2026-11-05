@@ -8,7 +8,9 @@
 namespace ht {
 
 struct Config {
-  std::string deviceName = "HeadTrackerC3";
+  // Empty: connect to any tracker (found by its service UUID). Set a name
+  // (e.g. HeadTracker-M5) only to pick one when several are switched on.
+  std::string deviceName;
   double gainYaw = 1.0, gainPitch = 1.0, gainRoll = 1.0;  // 1:1 head-to-view by default
   bool invertYaw = false, invertPitch = false, invertRoll = false;
   double deadzoneDeg = 0.0;      // optional: ignore tiny movements around center

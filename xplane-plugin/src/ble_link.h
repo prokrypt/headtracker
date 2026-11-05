@@ -41,6 +41,7 @@ class BleLink {
 
   Sample latest();
   bool connected() const { return connected_; }
+  std::string trackerName();  // Bluetooth name of the connected tracker, "" if none
   // False when the connected tracker runs firmware from before 1.2.0, which
   // can't take commands (recenter, calibration).
   bool canCommand() const { return hasControl_; }
@@ -70,7 +71,9 @@ class BleLink {
   std::condition_variable cmdCv_;
   std::deque<uint8_t> commands_;
 
-  std::string deviceName_;
+  std::string deviceName_;  // "" = any tracker
+  std::mutex nameMutex_;
+  std::string trackerName_;
   std::thread thread_;
   std::atomic<bool> stop_{false};
   std::atomic<bool> connected_{false};

@@ -85,6 +85,11 @@ enum CalResult : uint8_t {
   CAL_SIDEWAYS = 3,     // the head turned left/right instead of nodding
   CAL_NO_STEP1 = 4,     // step 2 without a (still valid) step 1
   CAL_SAVE_FAILED = 5,  // worked, but couldn't be written to flash
+  // Compass calibration (M5Stack build)
+  CAL_MAG_COVERAGE = 6, // not turned far enough in every direction
+  CAL_MAG_FIT = 7,      // readings don't fit one steady field (something magnetic nearby moved?)
+  CAL_MAG_AXES = 8,     // couldn't match the compass axes to the gyro (turn it more)
+  CAL_NO_MAG = 9,       // no magnetometer (or the sensor isn't running)
 };
 
 static const float kMinNodDeg = 15.0f;

@@ -8,8 +8,8 @@ CTRL = "6e7a0003-3c1b-4b8a-9f2e-6b1d5a7c0de1"
 INFO = "6e7a0013-3c1b-4b8a-9f2e-6b1d5a7c0de1"
 async def main():
     t0 = time.time()
-    dev = await BleakScanner.find_device_by_name("HeadTrackerC3", timeout=10)
-    if not dev: sys.exit("HeadTrackerC3 not found")
+    dev = await BleakScanner.find_device_by_filter(lambda d, a: "6e7a0001-3c1b-4b8a-9f2e-6b1d5a7c0de1" in (a.service_uuids or []), timeout=10)
+    if not dev: sys.exit("no tracker found")
     print(f"found {dev.address} in {time.time()-t0:.1f}s")
     async with BleakClient(dev) as c:
         print(f"connected, MTU {c.mtu_size}")

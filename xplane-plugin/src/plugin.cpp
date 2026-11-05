@@ -148,7 +148,7 @@ bool readIni(const std::string &file, Config &c, bool profile) {
     if (k == "sensor_forward" || k == "sensor_up") continue;  // old setting, the tracker calibrates itself now
     if (profile && k == "device_name") continue;
     try {
-      if (k == "device_name") c.deviceName = v;
+      if (k == "device_name") c.deviceName = v == "HeadTrackerC3" ? "" : v;  // old default name: any tracker now
       else if (k == "gain_yaw") c.gainYaw = toNumber(v);
       else if (k == "gain_pitch") c.gainPitch = toNumber(v);
       else if (k == "gain_roll") c.gainRoll = toNumber(v);
@@ -734,10 +734,11 @@ void resetConfig() {
 
 std::string statusText() {
   if (!gLink) return "Off";
-  if (!gLink->connected()) return "Searching for " + gConfig.deviceName + "...";
+  if (!gLink->connected())
+    return gConfig.deviceName.empty() ? "Searching for the tracker..." : "Searching for " + gConfig.deviceName + "...";
   if (!gLink->canCommand()) return "Connected, but its firmware is too old (needs 1.2.0)";
-  char b[96];
-  std::snprintf(b, sizeof(b), "Connected, %.0f updates/s, mount %s", gRateHz,
+  char b[160];
+  std::snprintf(b, sizeof(b), "%s connected, %.0f updates/s, mount %s", gLink->trackerName().c_str(), gRateHz,
                 mountCalibrated() ? "calibrated" : "not calibrated (flat, +Y forward)");
   return b;
 }
@@ -751,7 +752,9 @@ bool saveConfig() {
          "# Easiest to change in the sim: Plugins > Head Tracker > Settings.\n"
          "# The Save default button there rewrites this file. Named profiles live\n"
          "# in the profiles/ folder next to it.\n\n"
-         "# Changing the name needs a plugin reload (Plugin Admin) or restart.\n"
+         "# device_name: empty = connect to any tracker (HeadTracker-C3, HeadTracker-M5).\n"
+         "# Set a name only to pick one when several are on. Changing it needs a\n"
+         "# plugin reload (Plugin Admin) or restart.\n"
       << "device_name = " << c.deviceName << "\n\n";
   writeTuning(out, c);
   out << "\n# How the tracker sits on your head is measured by the tracker itself\n"
@@ -946,7 +949,7 @@ PLUGIN_API int XPluginEnable() {
   gLink = std::make_unique<BleLink>(gConfig.deviceName);
   gLink->start();
   XPLMRegisterFlightLoopCallback(flightLoop, -1.0f, nullptr);
-  debug("enabled, looking for " + gConfig.deviceName);
+  debug("enabled, looking for " + (gConfig.deviceName.empty() ? std::string("any tracker") : gConfig.deviceName));
   return 1;
 }
 

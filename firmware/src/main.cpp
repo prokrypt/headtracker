@@ -10,6 +10,7 @@
 //                      roll > 0 tilts the right ear down
 //   uint8 flags        bit0 = recenter button is held
 //                      bit1 = mount is calibrated (0 = default: board flat, +Y to the nose)
+//                      bit2 = the compass is correcting yaw right now
 //                      bits4-7 = recenter count, +1 on every recenter
 //   uint8 seq          increments every packet
 //
@@ -18,6 +19,9 @@
 //   02  calibration step 1: capture "looking straight ahead"
 //   03  calibration step 2: capture "nodded down", work out the mount, save it, recenter
 //   04  forget the calibration (back to the default mount)
+//   05  compass calibration (M5Stack build): turn the tracker every way for
+//       20s, the reply comes at the end (button B does the same)
+//   06  forget the compass calibration (M5Stack build)
 // Reply (notify): <u8 command> <u8 result>, result 0 = OK, see CalResult in mount.h.
 //
 // The tracker recenters by itself when the sensor (re)starts (after it slept
@@ -33,10 +37,31 @@
 // tracker sends simulated head motion at 100 Hz instead, for testing Bluetooth,
 // the plugin and OTA before the sensor arrives. That build keeps its mount
 // calibration under its own flash key, so it never leaks into the real one.
+//
+// The BNO085 runs its ARVR-stabilized Rotation Vector: gyro + accelerometer +
+// magnetometer, so yaw doesn't drift, with heading corrections applied only
+// while the head moves (no visible creep). Its own sensor calibration (DCD)
+// runs all the time and is saved to the BNO085's flash when it's good.
+//
+// Built with IMU_MPU6886=1 (pio env m5core) it runs on an M5Stack Core instead:
+// classic ESP32, its built-in MPU6886 + BMM150, fusion done here (see
+// imu6886.h). Same protocol; it advertises as HeadTracker-M5. Button A recenters, button B calibrates the compass.
+// It powers itself off after a minute lying still or a minute without a
+// connection (red button or button A turns it back on). With the M5GO/Fire
+// base fitted, its LED bar shows power on/off and connection changes briefly. No light sleep on
+// that board (no 32kHz crystal for BLE).
 
 #include <Arduino.h>
 #include <Wire.h>
+#ifndef IMU_MPU6886
+#define IMU_MPU6886 0
+#endif
+#if IMU_MPU6886
+#include "imu6886.h"
+#include <Adafruit_NeoPixel.h>
+#else
 #include <Adafruit_BNO08x.h>
+#endif
 #include <NimBLEDevice.h>
 #include <Preferences.h>
 #include <driver/gpio.h>
@@ -54,6 +79,20 @@
 // NVS namespace for the mount calibration.
 static const char *PREFS_NS = FAKE_SENSOR ? "trackerfake" : "tracker";
 
+#if IMU_MPU6886
+// ---- Pins (M5Stack Core) ----
+static const int PIN_SDA = 21;       // internal I2C: MPU6886, BMM150, IP5306
+static const int PIN_SCL = 22;
+static const int PIN_RECENTER = 39;  // button A, active low (pull-up on the board)
+static const int PIN_MAGCAL = 38;    // button B: compass calibration
+static const int PIN_LCD_BL = 32;    // LCD backlight, kept off (LCD isn't used)
+static const int PIN_SPEAKER = 25;   // held low, or the speaker hisses (no sounds: too loud)
+static const int PIN_LEDBAR = 15;    // M5GO/Fire base: 10 SK6812 LEDs (fine without the base)
+static const int NUM_LEDS = 10;
+static const uint32_t SAMPLE_INTERVAL_US = 5000;   // read the IMU at 200Hz, send every 2nd
+static const uint32_t OFF_STILL_S = 60;             // power off after lying still this long
+static const uint32_t OFF_NO_CONN_MS = 60000;       // or after this long without a connection
+#else
 // ---- Pins (ESP32-C3 Super Mini) ----
 // GPIO2/8/9 are strapping pins and GPIO8 drives the onboard LED, so avoid them
 // for the sensor. GPIO9 is the BOOT button, which we reuse as "recenter".
@@ -63,25 +102,49 @@ static const int PIN_BNO_RST = 10;   // BNO085 RST (optional but recommended)
 static const int PIN_BNO_INT = 4;    // BNO085 INT, active low (optional, saves power)
 static const int PIN_RECENTER = 9;   // onboard BOOT button, active low
 static const int PIN_LED = 8;        // onboard LED, active low
+#endif
 
 static const uint32_t REPORT_INTERVAL_US = 10000;  // 100 Hz
 static const uint32_t SENSOR_LINGER_MS = 10000;    // sensor keeps running this long after X-Plane leaves
 
 // ---- BLE identifiers (must match the plugin) ----
-static const char *DEVICE_NAME = "HeadTrackerC3";
+// The plugin and the updater find the tracker by SERVICE_UUID, so the name is
+// only for telling trackers apart.
+static const char *DEVICE_NAME = IMU_MPU6886 ? "HeadTracker-M5" : "HeadTracker-C3";
 static const char *SERVICE_UUID = "6e7a0001-3c1b-4b8a-9f2e-6b1d5a7c0de1";
 static const char *QUAT_CHAR_UUID = "6e7a0002-3c1b-4b8a-9f2e-6b1d5a7c0de1";
 static const char *CTRL_CHAR_UUID = "6e7a0003-3c1b-4b8a-9f2e-6b1d5a7c0de1";
 
-enum : uint8_t { CMD_RECENTER = 0x01, CMD_CAL_AHEAD = 0x02, CMD_CAL_NOD = 0x03, CMD_CAL_RESET = 0x04 };
+enum : uint8_t {
+  CMD_RECENTER = 0x01, CMD_CAL_AHEAD = 0x02, CMD_CAL_NOD = 0x03, CMD_CAL_RESET = 0x04,
+  CMD_MAG_CAL = 0x05, CMD_MAG_RESET = 0x06,
+};
 
 // Advertise slowly while idle (units of 0.625 ms): about 0.5 s between beacons.
 // The plugin scans for 4 s at a time, so it still finds the tracker quickly.
 static const uint16_t ADV_INTERVAL_MIN = 720;
 static const uint16_t ADV_INTERVAL_MAX = 800;
 
+#if IMU_MPU6886
+static Mpu6886 imu;
+static Fusion fusion;
+static uint32_t lastImuUs = 0;
+static uint8_t imuSkip = 0;  // samples to throw away after (re)start
+static Bmm150 bmm;
+static MagCal magCal;
+static MagCalibrator magCalibrator;
+static uint32_t lastMagUs = 0;
+static uint32_t noConnSince = 0;  // for powering off
+enum class Anim : uint8_t { None, PowerOn, Connected, Disconnected, Recenter, CalOk, CalFail };
+static void ledAnim(Anim a);
+#else
 static Adafruit_BNO08x bno(PIN_BNO_RST);
-static sh2_SensorValue_t sensorValue;
+[[maybe_unused]] static sh2_SensorValue_t sensorValue;
+// ARVR-stabilized Rotation Vector: uses the magnetometer, corrects only while moving.
+static const sh2_SensorId_t ROTATION_REPORT = SH2_ARVR_STABILIZED_RV;
+[[maybe_unused]] static uint8_t bnoAccuracy = 0;   // 0 unreliable .. 3 high (mostly the magnetometer calibration)
+[[maybe_unused]] static uint32_t lastDcdSaveMs = 0;
+#endif
 static NimBLEServer *server = nullptr;
 static NimBLECharacteristic *quatChar = nullptr;
 static NimBLECharacteristic *ctrlChar = nullptr;
@@ -92,7 +155,7 @@ static bool sensorAwake = false;
 static uint8_t seq = 0;
 static uint8_t sensorEpoch = 0;  // +1 whenever the BNO085 (re)starts; its yaw reference starts over then
 static uint32_t sensorStartMs = 0;  // when it last (re)started, for the "stopped reporting" check
-static SemaphoreHandle_t intSem;
+[[maybe_unused]] static SemaphoreHandle_t intSem;
 
 // Mount and recenter state (only touched by loop()).
 static Q mountRot;             // head = sensor * mountRot
@@ -110,7 +173,7 @@ static bool calAheadValid = false;
 static uint8_t calAheadEpoch = 0;
 static Preferences prefs;
 
-#if CONFIG_PM_ENABLE
+#if CONFIG_PM_ENABLE && CONFIG_IDF_TARGET_ESP32C3
 static esp_pm_lock_handle_t usbLock;  // stay awake while plugged into a computer
 static bool usbLockHeld = false;
 #endif
@@ -169,6 +232,29 @@ static bool saveMount() {
   return ok;
 }
 
+#if IMU_MPU6886
+// Gyro bias, so a fresh start begins close to right (refined once it holds still).
+static void loadBias() {
+  float b[3] = {0, 0, 0};
+  prefs.begin(PREFS_NS, true);
+  bool ok = prefs.getBytes("gbias", b, sizeof(b)) == sizeof(b);
+  prefs.end();
+  ok = ok && isfinite(b[0]) && isfinite(b[1]) && isfinite(b[2]) && fabsf(b[0]) + fabsf(b[1]) + fabsf(b[2]) < 1.0f;
+  fusion.setBias(ok ? V{b[0], b[1], b[2]} : V{}, true);
+}
+
+static void saveBias() {
+  V v = fusion.bias();
+  float b[3] = {v.x, v.y, v.z};
+  if (prefs.begin(PREFS_NS, false)) {
+    prefs.putBytes("gbias", b, sizeof(b));
+    prefs.end();
+  }
+  const float k = 180.0f / (float)M_PI;
+  Serial.printf("Gyro bias %.3f %.3f %.3f dps saved\n", v.x * k, v.y * k, v.z * k);
+}
+#endif
+
 static void reply(uint8_t cmd, uint8_t result) {
   uint8_t p[2] = {cmd, result};
   ctrlChar->setValue(p, sizeof(p));
@@ -185,13 +271,30 @@ static void setReference(const Q &sensorQ) {
   recenterCount++;
 }
 
+#if IMU_MPU6886
+static void startMagCal();
+static void forgetMagCal();
+#endif
+
 static void handleCommand(uint8_t cmd) {
   switch (cmd) {
+#if IMU_MPU6886
+    case CMD_MAG_CAL:
+      startMagCal();  // replies when it's done, 20s later
+      break;
+    case CMD_MAG_RESET:
+      forgetMagCal();
+      reply(cmd, CAL_OK);
+      break;
+#endif
     case CMD_RECENTER:
       // Applied on the next sample, which is at most 10 ms away while connected.
       recenterPending = true;
       reply(cmd, CAL_OK);
       Serial.println("Recenter requested");
+#if IMU_MPU6886
+      ledAnim(Anim::Recenter);
+#endif
       break;
     case CMD_CAL_AHEAD:
       if (!sampleFresh()) { reply(cmd, CAL_NO_DATA); break; }
@@ -230,6 +333,7 @@ static void handleCommand(uint8_t cmd) {
   }
 }
 
+#if !IMU_MPU6886
 static void IRAM_ATTR onBnoInt(void *) {
   // Level interrupt: mask it until the main loop has read the sample,
   // otherwise it would fire continuously while INT is held low.
@@ -253,9 +357,10 @@ static void setupInt() {
   gpio_wakeup_enable((gpio_num_t)PIN_BNO_INT, GPIO_INTR_LOW_LEVEL);
   esp_sleep_enable_gpio_wakeup();
 }
+#endif
 
 static void setupPower() {
-#if CONFIG_PM_ENABLE
+#if CONFIG_PM_ENABLE && CONFIG_IDF_TARGET_ESP32C3
   esp_pm_config_esp32c3_t pm = {};
   pm.max_freq_mhz = 160;
   pm.min_freq_mhz = 40;          // drop to the crystal clock when idle
@@ -266,7 +371,7 @@ static void setupPower() {
   esp_pm_lock_acquire(usbLock);  // until we know whether a computer is attached
   usbLockHeld = true;
 #else
-  Serial.println("Power: built without CONFIG_PM_ENABLE, no light sleep");
+  Serial.println("Power: no light sleep on this build");
 #endif
 }
 
@@ -274,7 +379,7 @@ static void setupPower() {
 // uploads awkward. So while a computer's USB port is attached, stay awake.
 // On a power bank or battery there's no USB host, and the chip sleeps.
 static void updateUsbLock() {
-#if CONFIG_PM_ENABLE
+#if CONFIG_PM_ENABLE && CONFIG_IDF_TARGET_ESP32C3
   static uint32_t last = 0;
   if (millis() < 3000 || millis() - last < 1000) return;  // give USB 3 s to enumerate
   last = millis();
@@ -301,38 +406,88 @@ static Q fakeSensorQ() {
 }
 #endif
 
+#if !FAKE_SENSOR && !IMU_MPU6886
+// Rotation report plus the BNO085's own dynamic calibration of all three
+// sensors. Both are lost when the BNO085 resets, so this runs after every
+// (re)start. The saved calibration (DCD) is loaded by the BNO085 at boot.
+static bool enableRotation() {
+  sh2_setCalConfig(SH2_CAL_ACCEL | SH2_CAL_GYRO | SH2_CAL_MAG);
+  // We save it ourselves (saveDcdIfGood): only good calibrations, and rarely,
+  // because the BNO085's flash wears out after some tens of thousands of erases.
+  sh2_setDcdAutoSave(false);
+  bnoAccuracy = 0;
+  return bno.enableReport(ROTATION_REPORT, REPORT_INTERVAL_US);
+}
+
+// While running: at "high" accuracy, at most every 30 minutes. On the way to
+// sleep (end of a session): at "medium" or better, if the last save was 15+
+// minutes ago. A few saves per flying day.
+static void saveDcdIfGood(bool sleeping) {
+  if (bnoAccuracy < (sleeping ? 2 : 3)) return;
+  uint32_t minGap = sleeping ? 15 * 60000UL : 30 * 60000UL;
+  if (lastDcdSaveMs != 0 && millis() - lastDcdSaveMs < minGap) return;
+  if (sh2_saveDcdNow() == SH2_OK) {
+    lastDcdSaveMs = millis();
+    Serial.printf("BNO085 calibration saved (accuracy %u)\n", bnoAccuracy);
+  }
+}
+#endif
+
 static bool startSensor() {
 #if FAKE_SENSOR
   sensorEpoch++;
   sensorStartMs = millis();
   sensorAwake = true;
   return true;
-#endif
+#elif IMU_MPU6886
+  if (!imu.begin(Wire)) return false;
+  if (bmm.begin(Wire)) Serial.printf("BMM150 at 0x%02x\n", bmm.address());
+  else Serial.println("BMM150 not found, yaw will drift");
+  fusion.reset();
+  sensorEpoch++;
+  sensorStartMs = millis();
+  sensorAwake = true;
+  imuSkip = 10;
+  return true;
+#else
   // Clone boards ship with ADO either low (0x4A) or high (0x4B); try both.
   if (bno.begin_I2C(0x4A, &Wire) || bno.begin_I2C(0x4B, &Wire)) {
     sensorEpoch++;
     sensorStartMs = millis();
-    sensorAwake = bno.enableReport(SH2_GAME_ROTATION_VECTOR, REPORT_INTERVAL_US);
+    sensorAwake = enableRotation();
     return sensorAwake;
   }
   return false;
+#endif
 }
 
 // The BNO085 draws several mA while fusing, so park it when nobody listens.
 static void sensorSleep(bool sleep) {
   if (sleep == !sensorAwake) return;
   if (sleep) {
-    if (!FAKE_SENSOR) sh2_devSleep();
+#if IMU_MPU6886
+    imu.sleep(true);
+    bmm.suspend();
+    if (fusion.biasChanged) { saveBias(); fusion.biasChanged = false; }
+#elif !FAKE_SENSOR
+    saveDcdIfGood(true);
+    sh2_devSleep();
+#endif
   } else {
-    if (!FAKE_SENSOR) {
-      sh2_devOn();
-      bno.enableReport(SH2_GAME_ROTATION_VECTOR, REPORT_INTERVAL_US);
-    }
+#if IMU_MPU6886
+    imu.sleep(false);
+    bmm.begin(Wire);
+    fusion.reset();
+    imuSkip = 10;  // ~50ms for the gyro to settle
+#elif !FAKE_SENSOR
+    sh2_devOn();
+    enableRotation();
+#endif
     sensorEpoch++;
     sensorStartMs = millis();
   }
   sensorAwake = !sleep;
-  Serial.println(sleep ? "BNO085 sleeping (nobody listening)" : "BNO085 awake");
+  Serial.println(sleep ? "Sensor sleeping (nobody listening)" : "Sensor awake");
 }
 
 static void startBle() {
@@ -362,6 +517,10 @@ static void startBle() {
 // Returns how many ms until the LED next has to change, so the idle loop can
 // sleep exactly that long instead of waking up every few ms.
 static uint32_t updateLed(bool connected) {
+#if IMU_MPU6886
+  (void)connected;
+  return 20;  // no status LED on the M5Stack Core; poll the buttons and the LED bar instead
+#else
   uint32_t t = millis() % 2000;
   bool on = t < 40 || (connected && t >= 150 && t < 190);
   digitalWrite(PIN_LED, on ? LOW : HIGH);
@@ -372,11 +531,272 @@ static uint32_t updateLed(bool connected) {
   for (size_t i = 0; i < n; ++i)
     if (e[i] > t) return e[i] - t;
   return 1;
+#endif
 }
+
+#if IMU_MPU6886
+// ---- LED bar (M5GO/Fire base): short, dim animations, dark otherwise ----
+static Adafruit_NeoPixel strip(NUM_LEDS, PIN_LEDBAR, NEO_GRB + NEO_KHZ800);
+static Anim anim = Anim::None;
+static uint32_t animStart = 0;
+static uint32_t ledFrame[NUM_LEDS];
+static bool ledsDirty = true;
+
+static void ledAnim(Anim a) {
+  anim = a;
+  animStart = millis();
+}
+
+static uint32_t rgb(float r, float g, float b, float level) {  // 0..1 each, kept dim
+  auto c = [&](float v) { return (uint8_t)fminf(255.0f, fmaxf(0.0f, v * level * 48.0f)); };
+  return Adafruit_NeoPixel::Color(c(r), c(g), c(b));
+}
+
+// LEDs within `half` of the bar's middle (0 = none, 5 = all), soft edge.
+static float fromCenter(int i, float half) {
+  float d = fabsf(i - (NUM_LEDS - 1) / 2.0f) + 0.5f;
+  return fmaxf(0.0f, fminf(1.0f, half - d + 1.0f));
+}
+
+static void setFrame(int i, uint32_t c) {
+  if (ledFrame[i] != c) { ledFrame[i] = c; ledsDirty = true; }
+}
+
+static void updateLeds(bool waiting, float calProgress) {
+  static uint32_t lastMs = 0;
+  if (millis() - lastMs < 20) return;  // 50 frames/s is plenty
+  lastMs = millis();
+  uint32_t t = millis() - animStart;
+  for (int i = 0; i < NUM_LEDS; ++i) {
+    uint32_t c = 0;
+    switch (anim) {
+      case Anim::PowerOn: {  // rainbow sweeping along, fading out after 0.8s
+        float level = t < 800 ? fminf(1.0f, t / 200.0f) : 1.0f - (t - 800) / 500.0f;
+        c = Adafruit_NeoPixel::ColorHSV((uint16_t)(i * 6553 + t * 80), 255, 255);
+        c = rgb(((c >> 16) & 0xFF) / 255.0f, ((c >> 8) & 0xFF) / 255.0f, (c & 0xFF) / 255.0f, level);
+        if (t >= 1300) anim = Anim::None;
+        break;
+      }
+      case Anim::Connected: {  // green from the middle outward, then fade
+        float level = fromCenter(i, t / 60.0f) * (t < 400 ? 1.0f : 1.0f - (t - 400) / 400.0f);
+        c = rgb(0.1f, 1, 0.2f, level);
+        if (t >= 800) anim = Anim::None;
+        break;
+      }
+      case Anim::Disconnected: {  // amber closing in toward the middle
+        c = rgb(1, 0.45f, 0, fromCenter(i, 5.0f - t / 80.0f));
+        if (t >= 450) anim = Anim::None;
+        break;
+      }
+      case Anim::Recenter:  // quick white flash
+        c = rgb(1, 1, 1, 0.6f * (1.0f - t / 250.0f));
+        if (t >= 250) anim = Anim::None;
+        break;
+      case Anim::CalOk:
+      case Anim::CalFail: {  // two flashes
+        bool on = t % 300 < 150;
+        c = on ? (anim == Anim::CalOk ? rgb(0, 1, 0.1f, 1) : rgb(1, 0, 0, 1)) : 0;
+        if (t >= 600) anim = Anim::None;
+        break;
+      }
+      case Anim::None:
+        if (calProgress >= 0) {  // compass calibration: cyan bar filling over the 20s
+          float fill = calProgress * NUM_LEDS - i;
+          c = rgb(0, 0.8f, 1, fill >= 1 ? 0.5f : fill > 0 ? 0.5f * fill + 0.5f : 0.0f);
+        } else if (waiting && millis() % 3000 < 120 && (i == 4 || i == 5)) {
+          c = rgb(0, 0.2f, 1, 0.5f);  // waiting for X-Plane: short blue blip
+        }
+        break;
+    }
+    setFrame(i, c);
+  }
+  if (!ledsDirty) return;
+  for (int i = 0; i < NUM_LEDS; ++i) strip.setPixelColor(i, ledFrame[i]);
+  strip.show();
+  ledsDirty = false;
+}
+
+// IP5306 power chip, SYS_CTL0 bit1: keep the 5V boost on even at light load.
+// Off, it cuts the board's power ~30s after the load drops (that's how we
+// power off on battery: deep sleep draws next to nothing).
+static void ip5306KeepOn(bool on) {
+  Wire.beginTransmission(0x75);
+  Wire.write(0x00);
+  if (Wire.endTransmission(false) != 0 || Wire.requestFrom(0x75, 1) != 1) return;
+  uint8_t v = Wire.read();
+  v = on ? (v | 0x02) : (v & ~0x02);
+  Wire.beginTransmission(0x75);
+  Wire.write(0x00);
+  Wire.write(v);
+  Wire.endTransmission();
+}
+
+// ---- Compass calibration ----
+static void loadMagCal() {
+  MagCal c;
+  prefs.begin(PREFS_NS, true);
+  bool ok = prefs.getBytes("magcal", &c, sizeof(c)) == sizeof(c);
+  prefs.end();
+  magCal = ok && c.valid() ? c : MagCal();
+  Serial.println(magCal.valid() ? "Compass calibration loaded" : "No compass calibration (press button B)");
+}
+
+static bool saveMagCal() {
+  if (!prefs.begin(PREFS_NS, false)) return false;
+  bool ok = magCal.valid() ? prefs.putBytes("magcal", &magCal, sizeof(magCal)) == sizeof(magCal)
+                           : (!prefs.isKey("magcal") || prefs.remove("magcal"));
+  prefs.end();
+  return ok;
+}
+
+static void startMagCal() {
+  if (magCalibrator.active) return;
+  if (!sensorOk || !bmm.found()) {
+    reply(CMD_MAG_CAL, CAL_NO_MAG);
+    ledAnim(Anim::CalFail);
+    Serial.println("Compass calibration: no magnetometer");
+    return;
+  }
+  magCalibrator.start();
+  Serial.println("Compass calibration: turn the tracker every way for 20s");
+}
+
+static void forgetMagCal() {
+  magCal = MagCal();
+  saveMagCal();
+  fusion.resetMag();
+  Serial.println("Compass calibration cleared");
+}
+
+static void finishMagCal() {
+  MagCal c;
+  uint8_t r = magCalibrator.finish(c);
+  if (r == CAL_OK) {
+    magCal = c;
+    fusion.resetMag();
+    if (!saveMagCal()) r = CAL_SAVE_FAILED;
+    Serial.printf("Compass calibration: field %.1fuT, offset %.1f %.1f %.1f, scale %.3f %.3f %.3f, axes",
+                  c.field, c.offset[0], c.offset[1], c.offset[2], c.scale[0], c.scale[1], c.scale[2]);
+    for (int i = 0; i < 9; ++i) Serial.printf(" %d", c.P[i]);
+    Serial.println();
+  }
+  Serial.printf("Compass calibration: result %u\n", r);
+  reply(CMD_MAG_CAL, r);
+  ledAnim(r == CAL_OK || r == CAL_SAVE_FAILED ? Anim::CalOk : Anim::CalFail);
+}
+
+// Every IMU sample: feed the calibrator or the fusion with the BMM150 (30Hz).
+static void updateMag() {
+  if (!bmm.found()) return;
+  if (magCalibrator.active) magCalibrator.addGyro(fusion.lastGyro());
+  static uint8_t div = 0;
+  if (++div < 6) return;  // the BMM150 has a new reading every 33ms
+  V raw;
+  if (!bmm.read(raw)) return;  // not ready yet: try again next sample
+  div = 0;
+  uint32_t now = micros();
+  float dt = (now - lastMagUs) * 1e-6f;
+  lastMagUs = now;
+  if (magCalibrator.active) magCalibrator.addMag(raw, dt);
+  else if (magCal.valid()) fusion.updateMag(magCal.apply(raw), dt, magCal.field);
+}
+
+// ---- Power off ----
+static void powerOff(const char *why) {
+  Serial.printf("Powering off: %s\n", why);
+  if (fusion.biasChanged) saveBias();
+  imu.sleep(true);
+  bmm.suspend();
+  for (uint32_t t = 0; t <= 600; t += 20) {  // red shrinking to the middle
+    for (int i = 0; i < NUM_LEDS; ++i) strip.setPixelColor(i, rgb(1, 0, 0, fromCenter(i, 5.0f - t / 120.0f)));
+    strip.show();
+    delay(20);
+  }
+  strip.clear();
+  strip.show();
+  pinMode(PIN_LEDBAR, OUTPUT);
+  digitalWrite(PIN_LEDBAR, LOW);
+  gpio_hold_en((gpio_num_t)PIN_LEDBAR);
+  // Keep the speaker and backlight pins low through deep sleep.
+  gpio_hold_en((gpio_num_t)PIN_SPEAKER);
+  gpio_hold_en((gpio_num_t)PIN_LCD_BL);
+  gpio_deep_sleep_hold_en();
+  ip5306KeepOn(false);  // on battery the IP5306 now cuts power within ~30s
+  while (digitalRead(PIN_RECENTER) == LOW) delay(10);  // or button A would wake it at once
+  esp_sleep_enable_ext0_wakeup((gpio_num_t)PIN_RECENTER, 0);  // on USB power: button A wakes it
+  Serial.flush();
+  esp_deep_sleep_start();
+}
+
+// Buttons, LEDs and the power-off timers, every loop.
+static void m5Housekeeping() {
+  bool connected = server->getConnectedCount() > 0;
+  static bool wasConnected = false;
+  if (connected != wasConnected) ledAnim(connected ? Anim::Connected : Anim::Disconnected);
+  wasConnected = connected;
+  float calProgress = magCalibrator.active ? fminf(1.0f, magCalibrator.elapsedMs() / (float)MagCalibrator::kDurationMs) : -1.0f;
+  updateLeds(!connected, calProgress);
+  static uint8_t bCount = 0;
+  static bool bWas = false;
+  bCount = digitalRead(PIN_MAGCAL) == LOW ? (bCount < 3 ? bCount + 1 : 3) : 0;
+  bool b = bCount >= 3;
+  if (b && !bWas) {
+    startMagCal();
+    noConnSince = millis();
+  }
+  bWas = b;
+  if (digitalRead(PIN_RECENTER) == LOW) noConnSince = millis();  // any button = still in use
+
+  if (magCalibrator.active || otaInProgress()) {
+    noConnSince = millis();
+    return;
+  }
+  if (server->getConnectedCount() > 0) noConnSince = millis();
+  else if (millis() - noConnSince > OFF_NO_CONN_MS) powerOff("no connection for a minute");
+  if (sensorAwake && fusion.stillSeconds >= OFF_STILL_S) powerOff("lying still for a minute");
+}
+
+static void m5Setup() {
+  ip5306KeepOn(true);  // or on battery it may switch the board off at light load
+  // List what's on the internal bus (MPU6886 0x68, BMM150 0x10, IP5306 0x75).
+  Serial.print("I2C:");
+  for (uint8_t a = 1; a < 127; ++a) {
+    Wire.beginTransmission(a);
+    if (Wire.endTransmission() == 0) Serial.printf(" 0x%02x", a);
+  }
+  Serial.println();
+}
+#endif
 
 void setup() {
   Serial.begin(115200);
   setupPower();
+#if IMU_MPU6886
+  gpio_hold_dis((gpio_num_t)PIN_SPEAKER);  // held low through deep sleep
+  gpio_hold_dis((gpio_num_t)PIN_LCD_BL);
+  gpio_hold_dis((gpio_num_t)PIN_LEDBAR);
+  gpio_deep_sleep_hold_dis();
+  strip.begin();
+  strip.clear();
+  strip.show();
+  ledAnim(Anim::PowerOn);
+  pinMode(PIN_RECENTER, INPUT);
+  pinMode(PIN_MAGCAL, INPUT);
+  pinMode(PIN_LCD_BL, OUTPUT);
+  digitalWrite(PIN_LCD_BL, LOW);
+  pinMode(PIN_SPEAKER, OUTPUT);
+  digitalWrite(PIN_SPEAKER, LOW);
+  cmdQueue = xQueueCreate(8, sizeof(uint8_t));
+  loadMount();
+  Wire.begin(PIN_SDA, PIN_SCL);
+  Wire.setClock(400000);
+  m5Setup();
+  loadBias();
+  loadMagCal();
+  esp_sleep_wakeup_cause_t wake = esp_sleep_get_wakeup_cause();
+  if (wake == ESP_SLEEP_WAKEUP_EXT0) Serial.println("Woken by button A");
+  noConnSince = millis();
+#else
   pinMode(PIN_RECENTER, INPUT_PULLUP);
   pinMode(PIN_LED, OUTPUT);
   digitalWrite(PIN_LED, HIGH);  // off
@@ -398,10 +818,11 @@ void setup() {
 
   Wire.begin(PIN_SDA, PIN_SCL);
   Wire.setClock(400000);
+#endif
 
   // Bluetooth first, so a firmware update still works if the sensor is broken.
   startBle();
-  Serial.println("BLE advertising as HeadTrackerC3");
+  Serial.printf("BLE advertising as %s\n", DEVICE_NAME);
   if (FAKE_SENSOR) Serial.println("FAKE SENSOR build: no BNO085, sending simulated head motion");
 }
 
@@ -411,31 +832,39 @@ void loop() {
   uint32_t ledDue = updateLed(server->getConnectedCount() > 0);
   uint8_t cmd;
   while (xQueueReceive(cmdQueue, &cmd, 0) == pdTRUE) handleCommand(cmd);
+#if IMU_MPU6886
+  m5Housekeeping();
+#endif
 
   if (!sensorOk) {
     static uint32_t lastTry = 0;
     if (lastTry == 0 || millis() - lastTry > 1000) {
       lastTry = millis();
       sensorOk = startSensor();
-      Serial.println(sensorOk ? (FAKE_SENSOR ? "Fake sensor ready" : "BNO085 ready")
-                              : "BNO085 not found, check wiring. Retrying...");
+      Serial.println(sensorOk ? (FAKE_SENSOR ? "Fake sensor ready" : IMU_MPU6886 ? "MPU6886 ready" : "BNO085 ready")
+                              : "Sensor not found, check wiring. Retrying...");
     }
     vTaskDelay(pdMS_TO_TICKS(ledDue < 250 ? ledDue : 250));
     return;
   }
 
-  if (!FAKE_SENSOR && bno.wasReset()) {
+#if !FAKE_SENSOR && !IMU_MPU6886
+  if (bno.wasReset()) {
     Serial.println("BNO085 reset, re-enabling report");
     sensorEpoch++;
     sensorStartMs = millis();
-    sensorAwake = bno.enableReport(SH2_GAME_ROTATION_VECTOR, REPORT_INTERVAL_US);
+    sensorAwake = enableRotation();
   }
+#endif
 
   // Keep the sensor running for a while after the last listener left, so a
   // short Bluetooth drop doesn't restart it (that would lose the center).
   static uint32_t lastListened = 0;
   bool subscribed = quatChar->getSubscribedCount() > 0 && !otaInProgress();
   if (subscribed) lastListened = millis();
+#if IMU_MPU6886
+  if (magCalibrator.active) lastListened = millis();  // keep the sensors running for it
+#endif
   bool listening = subscribed || (sensorAwake && !otaInProgress() && millis() - lastListened < SENSOR_LINGER_MS);
   sensorSleep(!listening);
   // The sensor stopped reporting while someone listens (a loose wire, or the
@@ -444,7 +873,7 @@ void loop() {
   if (listening) {
     uint32_t since = haveSample && (int32_t)(lastSampleMs - sensorStartMs) > 0 ? lastSampleMs : sensorStartMs;
     if (millis() - since > 1000) {
-      Serial.println("BNO085 stopped reporting, restarting it");
+      Serial.println("Sensor stopped reporting, restarting it");
       sensorOk = false;
       haveSample = false;
       return;
@@ -454,8 +883,9 @@ void loop() {
     // INT also wakes the chip from light sleep. If the sensor has something
     // queued (a reply to the sleep command, a last sample), INT stays low until
     // it's read, and the chip would never get to sleep. So read it out.
-    if (!FAKE_SENSOR)
-      for (int i = 0; i < 8 && digitalRead(PIN_BNO_INT) == LOW; ++i) bno.getSensorEvent(&sensorValue);
+#if !FAKE_SENSOR && !IMU_MPU6886
+    for (int i = 0; i < 8 && digitalRead(PIN_BNO_INT) == LOW; ++i) bno.getSensorEvent(&sensorValue);
+#endif
     // Nothing to send: sleep until the LED needs to change, but check for a
     // new subscriber (X-Plane connecting) at least every 250 ms.
     vTaskDelay(pdMS_TO_TICKS(ledDue < 250 ? ledDue : 250));
@@ -470,6 +900,38 @@ void loop() {
   if ((int32_t)(xTaskGetTickCount() - nextWake) > (int32_t)pdMS_TO_TICKS(100)) nextWake = xTaskGetTickCount();  // after a pause, don't burst to catch up
   vTaskDelayUntil(&nextWake, pdMS_TO_TICKS(REPORT_INTERVAL_US / 1000));
   Q fq = fakeSensorQ();
+  float q[4] = {fq.w, fq.x, fq.y, fq.z};
+#elif IMU_MPU6886
+  // Read the IMU every 5ms and fuse; send every second sample (100Hz).
+  static TickType_t nextWake = xTaskGetTickCount();
+  if ((int32_t)(xTaskGetTickCount() - nextWake) > (int32_t)pdMS_TO_TICKS(100)) nextWake = xTaskGetTickCount();
+  vTaskDelayUntil(&nextWake, pdMS_TO_TICKS(SAMPLE_INTERVAL_US / 1000));
+  ImuSample smp;
+  if (!imu.read(smp)) return;  // a lasting failure trips the "stopped reporting" restart
+  uint32_t nowUs = micros();
+  float dt = (nowUs - lastImuUs) * 1e-6f;
+  lastImuUs = nowUs;
+  if (imuSkip) { imuSkip--; return; }
+  if (dt <= 0 || dt > 0.05f) dt = SAMPLE_INTERVAL_US * 1e-6f;
+  fusion.update(smp, dt);
+  updateMag();
+  static uint32_t lastStatus = 0;
+  if (millis() - lastStatus >= 5000) {
+    lastStatus = millis();
+    const float k = 180.0f / (float)M_PI;
+    V b = fusion.bias(), m = fusion.lastMean;
+    Serial.printf("imu: wobble %.2fdps, g range %.3fg, still %us, mean %.2f %.2f %.2fdps, bias %.2f %.2f %.2fdps%s, %.1fC, compass %s\n",
+                  fusion.lastStd * k, fusion.lastARange, (unsigned)fusion.stillSeconds, m.x * k, m.y * k, m.z * k,
+                  b.x * k, b.y * k, b.z * k, fusion.biasFresh ? "" : " (old)", smp.tempC,
+                  fusion.magActive() ? "on" : (magCal.valid() ? "waiting" : "not calibrated"));
+  }
+  if (magCalibrator.timeUp()) finishMagCal();
+  static bool savedThisRun = false;  // save the first fresh bias right away, later ones on sleep
+  if (fusion.biasChanged && !savedThisRun) { saveBias(); fusion.biasChanged = false; savedThisRun = true; }
+  static bool sendThis = false;
+  sendThis = !sendThis;
+  if (!sendThis) return;
+  Q fq = fusion.q();
   float q[4] = {fq.w, fq.x, fq.y, fq.z};
 #else
   // Wait for the next sample. With INT wired we sleep until the sensor says
@@ -488,11 +950,12 @@ void loop() {
   bool got = false;
   float q[4];
   while (bno.getSensorEvent(&sensorValue)) {
-    if (sensorValue.sensorId == SH2_GAME_ROTATION_VECTOR) {
-      q[0] = sensorValue.un.gameRotationVector.real;
-      q[1] = sensorValue.un.gameRotationVector.i;
-      q[2] = sensorValue.un.gameRotationVector.j;
-      q[3] = sensorValue.un.gameRotationVector.k;
+    if (sensorValue.sensorId == ROTATION_REPORT) {
+      q[0] = sensorValue.un.arvrStabilizedRV.real;
+      q[1] = sensorValue.un.arvrStabilizedRV.i;
+      q[2] = sensorValue.un.arvrStabilizedRV.j;
+      q[3] = sensorValue.un.arvrStabilizedRV.k;
+      bnoAccuracy = sensorValue.status & 0x03;
       got = true;
     }
     if (digitalRead(PIN_BNO_INT) == HIGH) break;
@@ -503,6 +966,7 @@ void loop() {
     vTaskDelay(1);
     return;
   }
+  saveDcdIfGood(false);
 #endif
 
   Q sensorQ = qnorm(Q{q[0], q[1], q[2], q[3]});
@@ -512,9 +976,18 @@ void loop() {
 
   // Recenter on the BOOT button, on request, and whenever the sensor has
   // (re)started, because its yaw reference starts over then.
+  // Pressed only after 3 low reads in a row (30ms): GPIO39 on the classic
+  // ESP32 can glitch low for a moment while the radio is on.
   static bool lastButton = false;
-  bool button = digitalRead(PIN_RECENTER) == LOW;
-  if (button && !lastButton) recenterPending = true;
+  static uint8_t lowCount = 0;
+  lowCount = digitalRead(PIN_RECENTER) == LOW ? (lowCount < 3 ? lowCount + 1 : 3) : 0;
+  bool button = lowCount >= 3;
+  if (button && !lastButton) {
+    recenterPending = true;
+#if IMU_MPU6886
+    ledAnim(Anim::Recenter);
+#endif
+  }
   lastButton = button;
   if (recenterPending || !haveRef || refEpoch != sensorEpoch) setReference(sensorQ);
 
@@ -522,7 +995,15 @@ void loop() {
   float out[3] = {a.yaw, a.pitch, a.roll};
   uint8_t pkt[14];
   memcpy(pkt, out, sizeof(out));  // ESP32 is little-endian
-  pkt[12] = (button ? 0x01 : 0x00) | (mountCalibrated ? 0x02 : 0x00) | uint8_t((recenterCount & 0x0F) << 4);
+#if IMU_MPU6886
+  bool compass = fusion.magActive();
+#elif FAKE_SENSOR
+  bool compass = false;
+#else
+  bool compass = bnoAccuracy >= 2;
+#endif
+  pkt[12] = (button ? 0x01 : 0x00) | (mountCalibrated ? 0x02 : 0x00) | (compass ? 0x04 : 0x00) |
+            uint8_t((recenterCount & 0x0F) << 4);
   pkt[13] = seq++;
   if (!subscribed) return;  // lingering after a drop: keep the sensor going, nobody to tell
   quatChar->setValue(pkt, sizeof(pkt));

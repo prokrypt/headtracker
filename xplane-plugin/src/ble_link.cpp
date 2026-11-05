@@ -1,5 +1,6 @@
 #include "ble_link.h"
 
+#include <cctype>
 #include <cmath>
 #include <cstring>
 #include <optional>
@@ -13,7 +14,29 @@ const char *kServiceUuid = "6e7a0001-3c1b-4b8a-9f2e-6b1d5a7c0de1";
 const char *kQuatCharUuid = "6e7a0002-3c1b-4b8a-9f2e-6b1d5a7c0de1";
 const char *kCtrlCharUuid = "6e7a0003-3c1b-4b8a-9f2e-6b1d5a7c0de1";
 const size_t kPacketSize = 14;  // firmware 1.2.0+; older firmware sent 18 bytes
+
+bool sameUuid(std::string a, std::string b) {
+  if (a.size() != b.size()) return false;
+  for (size_t i = 0; i < a.size(); ++i)
+    if (std::tolower((unsigned char)a[i]) != std::tolower((unsigned char)b[i])) return false;
+  return true;
+}
+
+// A tracker advertises our service UUID. With a name set, only that one.
+bool isTracker(SimpleBLE::Peripheral &p, const std::string &name) {
+  try {
+    if (!name.empty()) return p.identifier() == name;
+    for (auto &s : p.services())  // before connecting: the advertised UUIDs
+      if (sameUuid(s.uuid(), kServiceUuid)) return true;
+  } catch (...) {}
+  return false;
+}
 }  // namespace
+
+std::string BleLink::trackerName() {
+  std::lock_guard<std::mutex> lock(nameMutex_);
+  return connected_ ? trackerName_ : "";
+}
 
 void BleLink::start() {
   if (thread_.joinable()) return;
@@ -123,12 +146,16 @@ void BleLink::run() {
       // Scan until the tracker shows up (or a few seconds pass).
       std::mutex foundMutex;
       std::optional<SimpleBLE::Peripheral> found;
-      adapter.set_callback_on_scan_found([&](SimpleBLE::Peripheral p) {
-        if (p.identifier() == deviceName_) {
+      // "Updated" too: the scan response (name) and UUIDs can come after the
+      // first sighting.
+      auto onSeen = [&](SimpleBLE::Peripheral p) {
+        if (isTracker(p, deviceName_)) {
           std::lock_guard<std::mutex> lock(foundMutex);
           if (!found) found = p;
         }
-      });
+      };
+      adapter.set_callback_on_scan_found(onSeen);
+      adapter.set_callback_on_scan_updated(onSeen);
       adapter.scan_start();
       auto scanEnd = std::chrono::steady_clock::now() + std::chrono::seconds(4);
       while (!stop_ && std::chrono::steady_clock::now() < scanEnd) {
@@ -140,6 +167,7 @@ void BleLink::run() {
       }
       adapter.scan_stop();
       adapter.set_callback_on_scan_found([](SimpleBLE::Peripheral) {});
+      adapter.set_callback_on_scan_updated([](SimpleBLE::Peripheral) {});
 
       std::optional<SimpleBLE::Peripheral> target;
       {
@@ -150,7 +178,13 @@ void BleLink::run() {
 
       current = *target;
       SimpleBLE::Peripheral &peripheral = *current;
-      log("Found " + deviceName_ + " (" + peripheral.address() + "), connecting");
+      std::string name = peripheral.identifier();
+      if (name.empty()) name = "tracker";
+      {
+        std::lock_guard<std::mutex> lock(nameMutex_);
+        trackerName_ = name;
+      }
+      log("Found " + name + " (" + peripheral.address() + "), connecting");
       peripheral.connect();
       if (stop_) break;  // the plugin was disabled while connecting
 

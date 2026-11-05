@@ -44,6 +44,20 @@ The first USB flash has to be `pio run -t upload`, because it also writes the bo
 
 `pio run -e esp32c3-fake -t upload` builds the same firmware without the BNO085 (version `1.2.0-fake`). It sends simulated head motion at 100 Hz (yaw ±45°, pitch ±15°, roll ±8°, slow sine waves), so you can test Bluetooth, the plugin, recentering and OTA with just the bare C3. The serial log says "FAKE SENSOR build". Its mount calibration is kept under a separate flash key, so calibrating against fake motion never carries over to the real firmware. Its `.bin` for Bluetooth updates is `.pio/build/esp32c3-fake/firmware.bin`. Going from the fake build to the real one (or back) over Bluetooth works like any other update.
 
+### M5Stack Core instead (MPU6886 + BMM150)
+
+`pio run -e m5core` builds the tracker for an M5Stack Core (Gray): the classic ESP32 on it plus its built-in MPU6886 (accelerometer + gyro) and BMM150 (compass). No wiring, wear the whole M5Stack. Same protocol, so the plugin and the updater work with it as they are. It advertises as `HeadTracker-M5` (the C3 as `HeadTracker-C3`); the plugin and the updater connect to whichever tracker they find. With two switched on, pick one with `device_name = HeadTracker-M5` in `head_tracker.ini` or `--name HeadTracker-M5` for the updater.
+
+* The firmware does the sensor fusion itself (`src/imu6886.h`): gyro integrated at 200Hz, tilt pulled toward gravity, gyro drift measured whenever the M5Stack lies still for a second (kept in flash).
+* **Compass calibration:** press **button B**, then turn the tracker every way (all sides up, slow figure-eights) for 20s. With the LED bar fitted, a cyan bar fills over the 20s, then two green flashes = OK, two red = try again (the serial log says why). Do it with the M5Stack fixed on the headset, since the headset's magnets count. It also works out how the compass axes line up with the gyro's, so nothing is assumed about the board. After that the compass slowly corrects yaw (~10s), and only while the field looks like the one at calibration; near a speaker it simply stops correcting. Without a calibration yaw drifts slowly; recenter now and then.
+* **Button A** recenters.
+* **LED bar** (M5GO/Fire base, 10 SK6812 on GPIO15), short and dim, dark the rest of the time: rainbow at power on, a blue blip every 3s while waiting for X-Plane, green spreading out on connect, amber closing in on disconnect, white flash on recenter, red shrinking to the middle at power off. No sounds (the speaker is too loud).
+* The MPU6886 has big gyro offsets (this one: about -4.5, -6.3, -11dps) that move as the board warms up. They're measured whenever it lies still (two seconds in a row that agree), so put it down for a few seconds after switching on.
+* **Powers itself off** after a minute lying still (on a desk) or a minute without a Bluetooth connection. On battery the red power button turns it on again; on USB it sleeps and button A (or the power button) wakes it.
+* USB flash (the ESP32's bootloader goes at 0x1000, not 0x0 as on the C3), from `.pio/build/m5core/`:
+  `esptool --chip esp32 -p /dev/ttyUSB0 -b 921600 write-flash -z 0x1000 bootloader.bin 0x8000 partitions.bin 0xe000 ota_data_initial.bin 0x10000 firmware.bin`
+  After that, Bluetooth updates work as on the C3 (`.pio/build/m5core/firmware.bin`).
+
 ## 3. Build the plugin
 
 ```
@@ -158,5 +172,5 @@ Everything here can also be changed in the settings window.
 * **G-loaded camera:** stays on while tracking. X-Plane takes anything a plugin writes as the new head position and adds its G push on top, so writing back what it read used to bake the push in and the view crept down. The plugin keeps its own base position instead and only passes the G push through.
 * **No tracker connected:** the plugin eases its offsets out, then stops writing the head entirely, so X-Plane's view works exactly as without the plugin (writing the head in an outside view would pull X-Plane back into the cockpit).
 * **Plugins > Head Tracker > Log head values (10s)** writes the head values X-Plane reports, before and after the flight model, to Log.txt. Handy if the view ever moves on its own.
-* Yaw drifts slowly because the Game Rotation Vector ignores the magnetometer on purpose. Tap recenter now and then.
+* **Yaw** comes from the BNO085's ARVR-stabilized Rotation Vector: gyro, accelerometer and magnetometer, so it doesn't drift, and its heading corrections are applied only while your head moves, so you never see the view creep. The BNO085 keeps calibrating its sensors while it runs and the tracker saves that calibration to the BNO085's flash when it's good (at most every 30 min at high accuracy, and when it goes to sleep at medium or better), so the next session starts calibrated. Big magnets or steel close to your head (speakers, a metal rig) can still pull the heading a little; recenter if it ever sits off.
 * SimpleBLE (the Bluetooth library) is free for personal, non-commercial use under its license.

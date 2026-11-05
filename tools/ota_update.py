@@ -22,6 +22,7 @@ try:
 except ImportError:
     sys.exit("This needs the 'bleak' Python package. See the README, section 5, for how to install it.")
 
+TRACKER_SERVICE_UUID = "6e7a0001-3c1b-4b8a-9f2e-6b1d5a7c0de1"  # advertised by every tracker
 CTRL_UUID = "6e7a0011-3c1b-4b8a-9f2e-6b1d5a7c0de1"
 DATA_UUID = "6e7a0012-3c1b-4b8a-9f2e-6b1d5a7c0de1"
 INFO_UUID = "6e7a0013-3c1b-4b8a-9f2e-6b1d5a7c0de1"
@@ -43,7 +44,7 @@ ERRORS = {
 }
 
 ESP_IMAGE_MAGIC = 0xE9
-ESP32C3_CHIP_ID = 5
+CHIP_NAMES = {0: "ESP32 (M5Stack)", 5: "ESP32-C3"}
 
 
 class FastPathFailed(Exception):
@@ -54,22 +55,38 @@ class OtaError(Exception):
     pass
 
 
-def check_image(image: bytes) -> None:
-    """Refuse files that aren't an app image for the ESP32-C3."""
+def check_image(image: bytes) -> int:
+    """Refuse files that aren't an app image for one of the trackers' chips. Returns the chip id."""
     if len(image) < 24 or image[0] != ESP_IMAGE_MAGIC:
-        raise OtaError("this isn't an ESP32 app image (use .pio/build/esp32c3/firmware.bin)")
+        raise OtaError("this isn't an ESP32 app image (use .pio/build/<env>/firmware.bin)")
     chip_id = struct.unpack_from("<H", image, 12)[0]
-    if chip_id != ESP32C3_CHIP_ID:
-        raise OtaError(f"this image is for a different chip (chip id {chip_id}, need 5 = ESP32-C3)")
+    if chip_id not in CHIP_NAMES:
+        raise OtaError(f"this image is for a chip no tracker uses (chip id {chip_id})")
+    return chip_id
 
 
-async def find_tracker(name: str, address: str | None, timeout: float):
+def check_chip_matches(dev, chip_id: int) -> None:
+    """The name tells the board: HeadTracker-M5 is an ESP32, HeadTracker-C3 a C3. The old
+    name HeadTrackerC3 was used on both; then the tracker's own check (esp_ota_end
+    verifies the image's chip id) is what refuses a wrong image."""
+    name = dev.name or ""
+    want = 0 if name.endswith("-M5") else 5 if name.endswith("-C3") else None
+    if want is not None and want != chip_id:
+        raise OtaError(f"{name} runs on an {CHIP_NAMES[want]}, but this image is for an {CHIP_NAMES[chip_id]}")
+
+
+async def find_tracker(name: str | None, address: str | None, timeout: float):
+    """By address, by name, or else the first device advertising the tracker service."""
     if address:
         dev = await BleakScanner.find_device_by_address(address, timeout=timeout)
-    else:
+    elif name:
         dev = await BleakScanner.find_device_by_name(name, timeout=timeout)
+    else:
+        dev = await BleakScanner.find_device_by_filter(
+            lambda d, adv: TRACKER_SERVICE_UUID in [u.lower() for u in adv.service_uuids or []],
+            timeout=timeout)
     if dev is None:
-        raise OtaError(f"couldn't find '{address or name}'. Is it powered and in range?")
+        raise OtaError(f"couldn't find {address or name or 'a tracker'}. Is it powered and in range?")
     return dev
 
 
@@ -236,8 +253,8 @@ async def main_async(args) -> int:
             image = f.read()
     except OSError as e:
         raise OtaError(f"can't read {args.firmware}: {e.strerror}")
-    check_image(image)
-    print(f"Firmware: {args.firmware} ({len(image) // 1024} KB)")
+    args.chip_id = check_image(image)
+    print(f"Firmware: {args.firmware} ({len(image) // 1024} KB, {CHIP_NAMES[args.chip_id]})")
 
     try:
         return await attempt(args, image, allow_fast=not args.no_fast)
@@ -253,7 +270,8 @@ async def main_async(args) -> int:
 
 async def attempt(args, image: bytes, allow_fast: bool) -> int:
     dev = await find_tracker(args.name, args.address, 30)
-    print(f"Found {dev.name or args.name} ({dev.address})")
+    print(f"Found {dev.name or args.name or 'tracker'} ({dev.address})")
+    check_chip_matches(dev, args.chip_id)
     async with BleakClient(dev) as client:
         try:
             before = await read_info(client)
@@ -288,7 +306,8 @@ async def attempt(args, image: bytes, allow_fast: bool) -> int:
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("firmware", help="firmware.bin from .pio/build/esp32c3/")
-    p.add_argument("--name", default="HeadTrackerC3", help="Bluetooth name (default HeadTrackerC3)")
+    p.add_argument("--name", help="Bluetooth name, e.g. HeadTracker-M5 (default: any tracker; "
+                   "give one when several are switched on)")
     p.add_argument("--address", help="Bluetooth address, if you have several trackers")
     p.add_argument("--no-fast", action="store_true", help="use acknowledged writes only (slower)")
     p.add_argument("--window", type=int, default=WINDOW_BYTES, help=argparse.SUPPRESS)
