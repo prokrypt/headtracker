@@ -697,6 +697,8 @@ static void setFrame(int i, uint32_t c) {
 enum class Battery : uint8_t { Ok, Low, Empty };  // see updateBattery()
 static Battery battery = Battery::Ok;
 
+static const uint32_t BLIP_ON_MS = 40;  // status blips: 2 frames at 50 frames/s
+
 static void updateLeds(bool waiting, float calProgress) {
   static uint32_t lastMs = 0;
   if (millis() - lastMs < 20) return;  // 50 frames/s is plenty
@@ -738,17 +740,17 @@ static void updateLeds(bool waiting, float calProgress) {
         if (calProgress >= 0) {  // compass calibration: cyan bar filling over the 20s
           float fill = calProgress * NUM_LEDS - i;
           c = rgb(0, 0.8f, 1, fill >= 1 ? 0.5f : fill > 0 ? 0.5f * fill + 0.5f : 0.0f);
-        } else if (waiting && millis() % 3000 < 120 && (i == 4 || i == 5)) {
-          c = rgb(0, 0.2f, 1, 0.5f);  // waiting for X-Plane: short blue blip
+        } else if (waiting && millis() % 3000 < BLIP_ON_MS && (i == 4 || i == 5)) {
+          c = rgb(0, 0.2f, 1, 0.2f);  // waiting for X-Plane: short, dim blue blip
         }
         // Low battery: red double blink at both ends every 3s. Nearly empty:
-        // the whole bar blinks red every second.
+        // the whole bar blinks red every second. Short and dim, like the blue.
         if (calProgress < 0) {
           uint32_t b3 = millis() % 3000;
-          bool lowOn = (b3 < 150 || (b3 >= 300 && b3 < 450)) && (i <= 1 || i >= NUM_LEDS - 2);
-          bool emptyOn = millis() % 1000 < 150;
-          if (battery == Battery::Low && lowOn) c = rgb(1, 0, 0, 1);
-          if (battery == Battery::Empty && emptyOn) c = rgb(1, 0, 0, 1);
+          bool lowOn = (b3 < BLIP_ON_MS || (b3 >= 200 && b3 < 200 + BLIP_ON_MS)) && (i <= 1 || i >= NUM_LEDS - 2);
+          bool emptyOn = millis() % 1000 < BLIP_ON_MS;
+          if (battery == Battery::Low && lowOn) c = rgb(1, 0, 0, 0.4f);
+          if (battery == Battery::Empty && emptyOn) c = rgb(1, 0, 0, 0.4f);
         }
         break;
     }
