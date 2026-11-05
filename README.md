@@ -40,6 +40,10 @@ If you change `sdkconfig.defaults` (or got a new copy of it), delete `firmware/s
 Flash over USB once like this. After that you can update over Bluetooth (section 5).
 The first USB flash has to be `pio run -t upload`, because it also writes the bootloader and the partition table. `builds/firmware.bin` on its own is only for Bluetooth updates.
 
+### No sensor yet? Fake-sensor build
+
+`pio run -e esp32c3-fake -t upload` builds the same firmware without the BNO085 (version `1.2.0-fake`). It sends simulated head motion at 100 Hz (yaw ±45°, pitch ±15°, roll ±8°, slow sine waves), so you can test Bluetooth, the plugin, recentering and OTA with just the bare C3. The serial log says "FAKE SENSOR build". Its mount calibration is kept under a separate flash key, so calibrating against fake motion never carries over to the real firmware. Its `.bin` for Bluetooth updates is `.pio/build/esp32c3-fake/firmware.bin`. Going from the fake build to the real one (or back) over Bluetooth works like any other update.
+
 ## 3. Build the plugin
 
 ```

@@ -28,6 +28,11 @@
 // sample, between BLE connection events, and almost all the time while nothing
 // is connected). Waking is driven by the BNO085's INT pin, so sleeping adds no
 // latency to tracking. Without INT wired it still works, it just polls.
+//
+// Built with FAKE_SENSOR=1 (pio env esp32c3-fake) there is no BNO085: the
+// tracker sends simulated head motion at 100 Hz instead, for testing Bluetooth,
+// the plugin and OTA before the sensor arrives. That build keeps its mount
+// calibration under its own flash key, so it never leaks into the real one.
 
 #include <Arduino.h>
 #include <Wire.h>
@@ -42,6 +47,12 @@
 
 #include "mount.h"
 #include "ota.h"
+
+#ifndef FAKE_SENSOR
+#define FAKE_SENSOR 0
+#endif
+// NVS namespace for the mount calibration.
+static const char *PREFS_NS = FAKE_SENSOR ? "trackerfake" : "tracker";
 
 // ---- Pins (ESP32-C3 Super Mini) ----
 // GPIO2/8/9 are strapping pins and GPIO8 drives the onboard LED, so avoid them
@@ -128,7 +139,7 @@ class CtrlCallbacks : public NimBLECharacteristicCallbacks {
 };
 
 static void loadMount() {
-  prefs.begin("tracker", true);
+  prefs.begin(PREFS_NS, true);
   float m[4] = {0, 0, 0, 0};
   bool ok = prefs.getBytes("mount", m, sizeof(m)) == sizeof(m);
   prefs.end();
@@ -146,7 +157,7 @@ static void loadMount() {
 }
 
 static bool saveMount() {
-  if (!prefs.begin("tracker", false)) return false;
+  if (!prefs.begin(PREFS_NS, false)) return false;
   bool ok;
   if (mountCalibrated) {
     float m[4] = {mountRot.w, mountRot.x, mountRot.y, mountRot.z};
@@ -273,7 +284,30 @@ static void updateUsbLock() {
 #endif
 }
 
+#if FAKE_SENSOR
+// Simulated head: slow look left/right, up/down and a little ear tilt, each on
+// its own period so the motion doesn't repeat quickly. Built so headAngles()
+// gives exactly these angles: M = Rz(-yaw) * Rx(pitch) * Ry(roll).
+static Q fakeSensorQ() {
+  const float d2r = (float)M_PI / 180.0f, tau = 2.0f * (float)M_PI;
+  float t = (millis() % 3600000UL) / 1000.0f;  // wrap hourly to keep float precision
+  float yaw = 45.0f * d2r * sinf(tau * t / 8.0f);
+  float pitch = 15.0f * d2r * sinf(tau * t / 5.3f);
+  float roll = 8.0f * d2r * sinf(tau * t / 6.7f);
+  Q qz{cosf(-yaw / 2), 0, 0, sinf(-yaw / 2)};
+  Q qx{cosf(pitch / 2), sinf(pitch / 2), 0, 0};
+  Q qy{cosf(roll / 2), 0, sinf(roll / 2), 0};
+  return qmul(qmul(qz, qx), qy);
+}
+#endif
+
 static bool startSensor() {
+#if FAKE_SENSOR
+  sensorEpoch++;
+  sensorStartMs = millis();
+  sensorAwake = true;
+  return true;
+#endif
   // Clone boards ship with ADO either low (0x4A) or high (0x4B); try both.
   if (bno.begin_I2C(0x4A, &Wire) || bno.begin_I2C(0x4B, &Wire)) {
     sensorEpoch++;
@@ -288,12 +322,14 @@ static bool startSensor() {
 static void sensorSleep(bool sleep) {
   if (sleep == !sensorAwake) return;
   if (sleep) {
-    sh2_devSleep();
+    if (!FAKE_SENSOR) sh2_devSleep();
   } else {
-    sh2_devOn();
+    if (!FAKE_SENSOR) {
+      sh2_devOn();
+      bno.enableReport(SH2_GAME_ROTATION_VECTOR, REPORT_INTERVAL_US);
+    }
     sensorEpoch++;
     sensorStartMs = millis();
-    bno.enableReport(SH2_GAME_ROTATION_VECTOR, REPORT_INTERVAL_US);
   }
   sensorAwake = !sleep;
   Serial.println(sleep ? "BNO085 sleeping (nobody listening)" : "BNO085 awake");
@@ -366,6 +402,7 @@ void setup() {
   // Bluetooth first, so a firmware update still works if the sensor is broken.
   startBle();
   Serial.println("BLE advertising as HeadTrackerC3");
+  if (FAKE_SENSOR) Serial.println("FAKE SENSOR build: no BNO085, sending simulated head motion");
 }
 
 void loop() {
@@ -380,13 +417,14 @@ void loop() {
     if (lastTry == 0 || millis() - lastTry > 1000) {
       lastTry = millis();
       sensorOk = startSensor();
-      Serial.println(sensorOk ? "BNO085 ready" : "BNO085 not found, check wiring. Retrying...");
+      Serial.println(sensorOk ? (FAKE_SENSOR ? "Fake sensor ready" : "BNO085 ready")
+                              : "BNO085 not found, check wiring. Retrying...");
     }
     vTaskDelay(pdMS_TO_TICKS(ledDue < 250 ? ledDue : 250));
     return;
   }
 
-  if (bno.wasReset()) {
+  if (!FAKE_SENSOR && bno.wasReset()) {
     Serial.println("BNO085 reset, re-enabling report");
     sensorEpoch++;
     sensorStartMs = millis();
@@ -416,13 +454,20 @@ void loop() {
     // INT also wakes the chip from light sleep. If the sensor has something
     // queued (a reply to the sleep command, a last sample), INT stays low until
     // it's read, and the chip would never get to sleep. So read it out.
-    for (int i = 0; i < 8 && digitalRead(PIN_BNO_INT) == LOW; ++i) bno.getSensorEvent(&sensorValue);
+    if (!FAKE_SENSOR)
+      for (int i = 0; i < 8 && digitalRead(PIN_BNO_INT) == LOW; ++i) bno.getSensorEvent(&sensorValue);
     // Nothing to send: sleep until the LED needs to change, but check for a
     // new subscriber (X-Plane connecting) at least every 250 ms.
     vTaskDelay(pdMS_TO_TICKS(ledDue < 250 ? ledDue : 250));
     return;
   }
 
+#if FAKE_SENSOR
+  // One simulated sample every 10 ms (100 Hz, like the real report rate).
+  vTaskDelay(pdMS_TO_TICKS(REPORT_INTERVAL_US / 1000));
+  Q fq = fakeSensorQ();
+  float q[4] = {fq.w, fq.x, fq.y, fq.z};
+#else
   // Wait for the next sample. With INT wired we sleep until the sensor says
   // it's ready, so there's no added latency; otherwise poll every 2 ms.
   if (digitalRead(PIN_BNO_INT) == HIGH) {
@@ -454,6 +499,7 @@ void loop() {
     vTaskDelay(1);
     return;
   }
+#endif
 
   Q sensorQ = qnorm(Q{q[0], q[1], q[2], q[3]});
   lastSensorQ = sensorQ;
