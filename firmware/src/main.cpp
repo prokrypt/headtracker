@@ -1103,6 +1103,22 @@ void loop() {
       sensorOk = startSensor();
       Serial.println(sensorOk ? (FAKE_SENSOR ? "Fake sensor ready" : IMU_MPU6886 ? "MPU6886 ready" : "BNO085 ready")
                               : "Sensor not found, check wiring. Retrying...");
+#if !FAKE_SENSOR && !IMU_MPU6886
+      // Wiring help: what answers on the bus, and the line levels. Idle SDA/SCL
+      // read 1 with pull-ups; INT goes low once the BNO085 has booted.
+      static uint8_t fails = 0;
+      if (!sensorOk && fails++ % 5 == 0) {
+        Serial.printf("Wiring check: SDA(GPIO%d)=%d SCL(GPIO%d)=%d INT(GPIO%d)=%d RST(GPIO%d)=%d, I2C:", PIN_SDA,
+                      gpio_get_level((gpio_num_t)PIN_SDA), PIN_SCL, gpio_get_level((gpio_num_t)PIN_SCL), PIN_BNO_INT,
+                      gpio_get_level((gpio_num_t)PIN_BNO_INT), PIN_BNO_RST, gpio_get_level((gpio_num_t)PIN_BNO_RST));
+        int found = 0;
+        for (uint8_t a = 1; a < 127; ++a) {
+          Wire.beginTransmission(a);
+          if (Wire.endTransmission() == 0) { Serial.printf(" 0x%02x", a); found++; }
+        }
+        Serial.println(found ? "" : " nothing");
+      }
+#endif
     }
     vTaskDelay(pdMS_TO_TICKS(ledDue < 250 ? ledDue : 250));
     return;
