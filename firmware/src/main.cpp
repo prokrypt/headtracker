@@ -152,10 +152,13 @@ static uint32_t noConnSince = 0;  // for powering off
 enum class Anim : uint8_t { None, PowerOn, Connected, Disconnected, Recenter, CalOk, CalFail };
 static void ledAnim(Anim a);
 #else
-static Adafruit_BNO08x bno(PIN_BNO_RST);
+static Adafruit_BNO08x bno(-1);  // we pulse RST ourselves (startSensor)
 [[maybe_unused]] static sh2_SensorValue_t sensorValue;
 // ARVR-stabilized Rotation Vector: uses the magnetometer, corrects only while moving.
-static const sh2_SensorId_t ROTATION_REPORT = SH2_ARVR_STABILIZED_RV;
+// ARVR-stabilized RV if the BNO08x firmware has it; older firmware (this
+// GY-BNO08X: SH-2 2.6.6) accepts it but never reports, then we fall back to
+// the plain Rotation Vector (also uses the compass, corrections not smoothed).
+static sh2_SensorId_t rotationReport = SH2_ARVR_STABILIZED_RV;
 [[maybe_unused]] static uint8_t bnoAccuracy = 0;   // 0 unreliable .. 3 high (mostly the magnetometer calibration)
 [[maybe_unused]] static uint32_t lastDcdSaveMs = 0;
 #endif
@@ -514,7 +517,7 @@ static bool enableRotation() {
   // because the BNO085's flash wears out after some tens of thousands of erases.
   sh2_setDcdAutoSave(false);
   bnoAccuracy = 0;
-  return bno.enableReport(ROTATION_REPORT, REPORT_INTERVAL_US);
+  return bno.enableReport(rotationReport, REPORT_INTERVAL_US);
 }
 
 // While running: at "high" accuracy, at most every 30 minutes. On the way to
@@ -548,12 +551,37 @@ static bool startSensor() {
   imuSkip = 10;
   return true;
 #else
-  // Clone boards ship with ADO either low (0x4A) or high (0x4B); try both.
-  if (bno.begin_I2C(0x4A, &Wire) || bno.begin_I2C(0x4B, &Wire)) {
-    sensorEpoch++;
-    sensorStartMs = millis();
-    sensorAwake = enableRotation();
-    return sensorAwake;
+  // A failed begin_I2C leaves the SH2 session open, and every later
+  // sh2_open then fails at once: close it before trying again.
+  static bool sh2Opened = false;
+  if (sh2Opened) { sh2_close(); sh2Opened = false; }
+  // Reset the BNO085 ourselves and wait until it has booted (INT goes low after
+  // ~115ms) before the library starts: its own reset sends the soft reset ~60ms
+  // after RST, mid-boot. Without INT wired: 300ms. (What actually made begin
+  // fail on the GY-BNO08X was the missing advertisement, see patch_bno08x.py.)
+  digitalWrite(PIN_BNO_RST, LOW);
+  delay(10);
+  digitalWrite(PIN_BNO_RST, HIGH);
+  for (uint32_t t0 = millis(); millis() - t0 < 300 && gpio_get_level((gpio_num_t)PIN_BNO_INT);) delay(2);
+  // Clone boards ship with ADO either low (0x4A) or high (0x4B). Probe first, so
+  // we only call begin (which opens the SH2 session) where something answers.
+  for (uint8_t addr : {0x4A, 0x4B}) {
+    Wire.beginTransmission(addr);
+    if (Wire.endTransmission() != 0) continue;
+    sh2Opened = true;
+    if (bno.begin_I2C(addr, &Wire)) {
+      // The library decodes reports into the buffer of the last getSensorEvent
+      // call, a null pointer until the first one: a report arriving during a
+      // command (enableReport, DCD save) crashed the C3. Point it at ours now.
+      bno.getSensorEvent(&sensorValue);
+      Serial.printf("BNO085 at 0x%02x, SH-2 version %u.%u.%u\n", addr, bno.prodIds.entry[0].swVersionMajor,
+                    bno.prodIds.entry[0].swVersionMinor, bno.prodIds.entry[0].swVersionPatch);
+      sensorEpoch++;
+      sensorStartMs = millis();
+      sensorAwake = enableRotation();
+      return sensorAwake;
+    }
+    return false;
   }
   return false;
 #endif
@@ -1073,7 +1101,7 @@ void setup() {
   loadMount();
 
   Wire.begin(PIN_SDA, PIN_SCL);
-  Wire.setClock(400000);
+  Wire.setClock(100000);  // plenty for 100Hz reports, and kinder to a clone's weak pull-ups
 #endif
 
   // Bluetooth first, so a firmware update still works if the sensor is broken.
@@ -1135,8 +1163,27 @@ void loop() {
         if (intLowAt) Serial.printf(" | INT low %ums after reset", (unsigned)intLowAt - 1);
         else Serial.print(" | INT stayed high 300ms after reset");
         scan(" | running");
+        // UART-RVC mode (PS0 high, PS1 low) sends 19-byte frames starting AA AA
+        // at 115200 out of the SDA pin, 100 times a second. Listen for 250ms.
+        Wire.end();
+        Serial1.begin(115200, SERIAL_8N1, PIN_SDA, -1);
+        uint32_t t1 = millis();
+        int bytes = 0, frames = 0;
+        uint8_t prev = 0;
+        while (millis() - t1 < 250) {
+          while (Serial1.available()) {
+            uint8_t b = Serial1.read();
+            if (bytes < 24) Serial.printf("%s%02x", bytes ? " " : " | UART on SDA: ", b);
+            bytes++;
+            if (prev == 0xAA && b == 0xAA) frames++;
+            prev = b;
+          }
+        }
+        Serial.printf(bytes ? " ... %d bytes, %d AA AA headers" : " | UART on SDA: silent", bytes, frames);
+        Serial1.end();
+        Wire.begin(PIN_SDA, PIN_SCL);
         Serial.println();
-        Wire.setClock(400000);
+        Wire.setClock(100000);
       }
 #endif
     }
@@ -1175,7 +1222,12 @@ void loop() {
   if (listening) {
     uint32_t since = haveSample && (int32_t)(lastSampleMs - sensorStartMs) > 0 ? lastSampleMs : sensorStartMs;
     if (millis() - since > 1000) {
-      Serial.println("Sensor stopped reporting, restarting it");
+      if (!haveSample && rotationReport == SH2_ARVR_STABILIZED_RV) {
+        rotationReport = SH2_ROTATION_VECTOR;
+        Serial.println("No ARVR-stabilized RV from this BNO08x firmware, using the Rotation Vector");
+      } else {
+        Serial.println("Sensor stopped reporting, restarting it");
+      }
       sensorOk = false;
       haveSample = false;
       return;
@@ -1252,11 +1304,13 @@ void loop() {
   bool got = false;
   float q[4];
   while (bno.getSensorEvent(&sensorValue)) {
-    if (sensorValue.sensorId == ROTATION_REPORT) {
-      q[0] = sensorValue.un.arvrStabilizedRV.real;
-      q[1] = sensorValue.un.arvrStabilizedRV.i;
-      q[2] = sensorValue.un.arvrStabilizedRV.j;
-      q[3] = sensorValue.un.arvrStabilizedRV.k;
+    if (sensorValue.sensorId == rotationReport) {
+      const auto &rv = rotationReport == SH2_ARVR_STABILIZED_RV ? sensorValue.un.arvrStabilizedRV
+                                                                  : sensorValue.un.rotationVector;
+      q[0] = rv.real;
+      q[1] = rv.i;
+      q[2] = rv.j;
+      q[3] = rv.k;
       bnoAccuracy = sensorValue.status & 0x03;
       got = true;
     }
