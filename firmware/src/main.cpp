@@ -574,8 +574,13 @@ static bool startSensor() {
       // call, a null pointer until the first one: a report arriving during a
       // command (enableReport, DCD save) crashed the C3. Point it at ours now.
       bno.getSensorEvent(&sensorValue);
-      Serial.printf("BNO085 at 0x%02x, SH-2 version %u.%u.%u\n", addr, bno.prodIds.entry[0].swVersionMajor,
-                    bno.prodIds.entry[0].swVersionMinor, bno.prodIds.entry[0].swVersionPatch);
+      Serial.printf("BNO08x at 0x%02x, firmware", addr);
+      for (int e = 0; e < bno.prodIds.numEntries; e++) {
+        const sh2_ProductId_t &p = bno.prodIds.entry[e];
+        Serial.printf(" | part %lu v%u.%u.%u build %lu", (unsigned long)p.swPartNumber, p.swVersionMajor,
+                      p.swVersionMinor, p.swVersionPatch, (unsigned long)p.swBuildNumber);
+      }
+      Serial.println();
       sensorEpoch++;
       sensorStartMs = millis();
       sensorAwake = enableRotation();
