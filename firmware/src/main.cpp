@@ -1111,12 +1111,32 @@ void loop() {
         Serial.printf("Wiring check: SDA(GPIO%d)=%d SCL(GPIO%d)=%d INT(GPIO%d)=%d RST(GPIO%d)=%d, I2C:", PIN_SDA,
                       gpio_get_level((gpio_num_t)PIN_SDA), PIN_SCL, gpio_get_level((gpio_num_t)PIN_SCL), PIN_BNO_INT,
                       gpio_get_level((gpio_num_t)PIN_BNO_INT), PIN_BNO_RST, gpio_get_level((gpio_num_t)PIN_BNO_RST));
-        int found = 0;
-        for (uint8_t a = 1; a < 127; ++a) {
-          Wire.beginTransmission(a);
-          if (Wire.endTransmission() == 0) { Serial.printf(" 0x%02x", a); found++; }
+        // At 100kHz: weak pull-ups on long wires can fail at 400kHz.
+        Wire.setClock(100000);
+        auto scan = [](const char *label) {
+          Serial.printf(" %s:", label);
+          int found = 0;
+          for (uint8_t a = 1; a < 127; ++a) {
+            Wire.beginTransmission(a);
+            if (Wire.endTransmission() == 0) { if (found < 12) Serial.printf(" 0x%02x", a); found++; }
+          }
+          Serial.printf(found ? " (%d)" : " nothing", found);
+        };
+        // With the BNO085 held in reset its pins float: anything that still
+        // answers is the wiring, not the sensor.
+        digitalWrite(PIN_BNO_RST, LOW);
+        delay(10);
+        scan("in-reset");
+        digitalWrite(PIN_BNO_RST, HIGH);
+        uint32_t t0 = millis(), intLowAt = 0;
+        while (millis() - t0 < 300 && !intLowAt) {
+          if (gpio_get_level((gpio_num_t)PIN_BNO_INT) == 0) intLowAt = millis() - t0 + 1;
         }
-        Serial.println(found ? "" : " nothing");
+        if (intLowAt) Serial.printf(" | INT low %ums after reset", (unsigned)intLowAt - 1);
+        else Serial.print(" | INT stayed high 300ms after reset");
+        scan(" | running");
+        Serial.println();
+        Wire.setClock(400000);
       }
 #endif
     }
