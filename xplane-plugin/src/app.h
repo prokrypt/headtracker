@@ -28,6 +28,9 @@ struct Config {
   double bodyRadiusCm = 15;      // neck distance in front of the torso's turning axis
   double bodyExtraYaw = 0.0;     // optional: extra view yaw per degree past the threshold
   double bodySmoothingMs = 150;  // the body follows a bit slower than the head
+  // Side lean: tilting your head also leans the upper body, moving the eyes
+  // further sideways than the neck alone. Pivot depth below the neck; 0 = off.
+  double leanCm = 20;
 };
 
 // Implemented in plugin.cpp

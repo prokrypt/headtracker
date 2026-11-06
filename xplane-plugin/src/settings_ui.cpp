@@ -50,6 +50,7 @@ std::vector<Slider> gSliders = {
     {"Body: shift", &Config::bodyRadiusCm, 0.0, 40.0, 1.0, "%.0f cm"},
     {"Body: +view", &Config::bodyExtraYaw, 0.0, 1.0, 0.05, "%.2fx"},
     {"Body: lag", &Config::bodySmoothingMs, 0.0, 500.0, 10.0, "%.0f ms"},
+    {"Lean (roll)", &Config::leanCm, 0.0, 50.0, 1.0, "%.0f cm"},
 };
 std::vector<Check> gChecks = {
     {"Invert yaw", &Config::invertYaw},

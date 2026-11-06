@@ -131,6 +131,7 @@ void sanitizeConfig() {
   fix(c.bodyRadiusCm, 0, 60, d.bodyRadiusCm);
   fix(c.bodyExtraYaw, 0, 3, d.bodyExtraYaw);
   fix(c.bodySmoothingMs, 0, 5000, d.bodySmoothingMs);
+  fix(c.leanCm, 0, 60, d.leanCm);
 }
 
 // Reads "key = value" lines into c. A profile only holds the tuning, not the
@@ -166,6 +167,7 @@ bool readIni(const std::string &file, Config &c, bool profile) {
       else if (k == "body_radius_cm") c.bodyRadiusCm = toNumber(v);
       else if (k == "body_extra_yaw") c.bodyExtraYaw = toNumber(v);
       else if (k == "body_smoothing_ms") c.bodySmoothingMs = toNumber(v);
+      else if (k == "lean_cm") c.leanCm = toNumber(v);
       else if (k == "max_yaw") c.maxYaw = toNumber(v);
       else if (k == "max_pitch") c.maxPitch = toNumber(v);
       else if (k == "max_roll") c.maxRoll = toNumber(v);
@@ -215,6 +217,9 @@ void writeTuning(std::ostream &out, const Config &c) {
       << "body_radius_cm = " << fmt(c.bodyRadiusCm) << "\n"
       << "body_extra_yaw = " << fmt(c.bodyExtraYaw) << "\n"
       << "body_smoothing_ms = " << fmt(c.bodySmoothingMs) << "\n\n"
+      << "# Side lean: tilting your head also leans your upper body, moving your\n"
+         "# eyes further sideways (lean_cm below the neck it pivots; 0 = off).\n"
+      << "lean_cm = " << fmt(c.leanCm) << "\n\n"
       << "max_yaw = " << fmt(c.maxYaw) << "\n"
       << "max_pitch = " << fmt(c.maxPitch) << "\n"
       << "max_roll = " << fmt(c.maxRoll) << "\n";
@@ -331,6 +336,10 @@ Vec3 eyeOffset(const Angles &view) {
   if (gConfig.bodyTurn) {
     Vec3 b = torsoOffset(gTorso, gConfig.bodyRadiusCm / 100.0);
     pos = {pos.x + b.x, pos.y + b.y, pos.z + b.z};
+  }
+  if (gConfig.leanCm > 0) {
+    Vec3 l = leanOffset(view.roll, gConfig.leanCm / 100.0);
+    pos = {pos.x + l.x, pos.y + l.y, pos.z + l.z};
   }
   return pos;
 }

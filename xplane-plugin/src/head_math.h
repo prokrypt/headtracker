@@ -43,4 +43,14 @@ inline Vec3 torsoOffset(double yawDeg, double radiusM) {
   return {-radiusM * std::sin(y), 0.0, -radiusM * std::cos(y) + radiusM};
 }
 
+// Side lean: tilting the head (roll) also leans the upper body, as when you
+// lean to look round a pillar. The eyes swing around a pivot `radiusM` below
+// the neck: sideways by radius * sin(roll), and down a little. Same axes as
+// neckOffset, roll + = tilt right = eyes move right. Added on top of the neck
+// model, which only swings them around the neck.
+inline Vec3 leanOffset(double rollDeg, double radiusM) {
+  double b = rollDeg * 3.14159265358979323846 / 180.0;
+  return {radiusM * std::sin(b), -radiusM * (1.0 - std::cos(b)), 0.0};
+}
+
 }  // namespace ht
