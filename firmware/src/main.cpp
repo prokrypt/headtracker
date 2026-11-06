@@ -23,6 +23,9 @@
 //       20s, the reply comes at the end (button B does the same)
 //   06  forget the compass calibration (M5Stack build)
 //   07  play the low-battery blip on the speaker (M5Stack build, for testing)
+//   08  send the last compass calibration's samples (M5Stack build, diagnostics):
+//       08 FF <u16 n>, then n x  08 <u16 i> <i16 mag x,y,z in 0.1uT>
+//       <i16 gyro x,y,z in mrad/s> <u8 dt ms>, then 08 FE <u16 n>. Takes ~n*10ms.
 //   71..7F  the same blip at DAC amplitude 1..15, to find a bearable volume
 // Reply (notify): <u8 command> <u8 result>, result 0 = OK, see CalResult in mount.h.
 //
@@ -127,7 +130,7 @@ static const char *CTRL_CHAR_UUID = "6e7a0003-3c1b-4b8a-9f2e-6b1d5a7c0de1";
 
 enum : uint8_t {
   CMD_RECENTER = 0x01, CMD_CAL_AHEAD = 0x02, CMD_CAL_NOD = 0x03, CMD_CAL_RESET = 0x04,
-  CMD_MAG_CAL = 0x05, CMD_MAG_RESET = 0x06, CMD_BLIP = 0x07,
+  CMD_MAG_CAL = 0x05, CMD_MAG_RESET = 0x06, CMD_BLIP = 0x07, CMD_MAG_DUMP = 0x08,
   CMD_BLIP_LEVEL = 0x70,  // 0x71..0x7F: blip at amplitude 1..15
 };
 
@@ -285,6 +288,7 @@ static void setReference(const Q &sensorQ) {
 #if IMU_MPU6886
 static void startMagCal();
 static void forgetMagCal();
+static void dumpMagCal();
 #endif
 
 #if IMU_MPU6886
@@ -361,6 +365,9 @@ static void handleCommand(uint8_t cmd) {
     case CMD_MAG_RESET:
       forgetMagCal();
       reply(cmd, CAL_OK);
+      break;
+    case CMD_MAG_DUMP:
+      dumpMagCal();
       break;
 #endif
     case CMD_RECENTER:
@@ -869,6 +876,43 @@ static void startMagCal() {
   Serial.println("Compass calibration: turn the tracker every way for 20s");
 }
 
+// Diagnostics: stream the last calibration's raw samples to the PC, paced so
+// NimBLE's buffers keep up. Blocks the loop for a few seconds (the sensor
+// restarts afterwards, which is fine for a diagnostic).
+static void dumpMagCal() {
+  if (magCalibrator.active) return;
+  int n = magCalibrator.count();
+  uint8_t h[4] = {CMD_MAG_DUMP, 0xFF, (uint8_t)n, (uint8_t)(n >> 8)};
+  ctrlChar->setValue(h, sizeof(h));
+  ctrlChar->notify();
+  delay(20);
+  auto put16 = [](uint8_t *p, float v) {
+    int32_t x = lroundf(v);
+    if (x > 32767) x = 32767;
+    if (x < -32768) x = -32768;
+    p[0] = (uint8_t)x;
+    p[1] = (uint8_t)(x >> 8);
+  };
+  for (int i = 0; i < n; ++i) {
+    const V &m = magCalibrator.magAt(i), &g = magCalibrator.gyroAt(i);
+    uint8_t p[16] = {CMD_MAG_DUMP, (uint8_t)i, (uint8_t)(i >> 8)};
+    put16(p + 3, m.x * 10);
+    put16(p + 5, m.y * 10);
+    put16(p + 7, m.z * 10);
+    put16(p + 9, g.x * 1000);
+    put16(p + 11, g.y * 1000);
+    put16(p + 13, g.z * 1000);
+    p[15] = (uint8_t)fminf(255.0f, magCalibrator.dtAt(i) * 1000.0f + 0.5f);
+    ctrlChar->setValue(p, sizeof(p));
+    ctrlChar->notify();
+    delay(10);
+  }
+  uint8_t e[4] = {CMD_MAG_DUMP, 0xFE, (uint8_t)n, (uint8_t)(n >> 8)};
+  ctrlChar->setValue(e, sizeof(e));
+  ctrlChar->notify();
+  Serial.printf("Compass calibration: sent %d samples\n", n);
+}
+
 static void forgetMagCal() {
   magCal = MagCal();
   saveMagCal();
@@ -1046,6 +1090,10 @@ void loop() {
   while (xQueueReceive(cmdQueue, &cmd, 0) == pdTRUE) handleCommand(cmd);
 #if IMU_MPU6886
   m5Housekeeping();
+  // Normally finished from the sample loop below; this ends it even if no
+  // samples came (sensor failed or asleep), with a red result instead of a
+  // full bar that never goes away.
+  if (magCalibrator.active && magCalibrator.elapsedMs() >= MagCalibrator::kDurationMs + 2000) finishMagCal();
 #endif
 
   if (!sensorOk) {
@@ -1078,6 +1126,12 @@ void loop() {
   if (magCalibrator.active) lastListened = millis();  // keep the sensors running for it
 #endif
   bool listening = subscribed || (sensorAwake && !otaInProgress() && millis() - lastListened < SENSOR_LINGER_MS);
+#if IMU_MPU6886
+  // A compass calibration needs the sensors even with nobody connected
+  // (button B with X-Plane closed): wake them for it. Without this the bar
+  // filled up and the calibration never finished.
+  if (magCalibrator.active && !otaInProgress()) listening = true;
+#endif
   sensorSleep(!listening);
   // The sensor stopped reporting while someone listens (a loose wire, or the
   // BNO08x's I2C hang): hard-reset it through RST. That starts a new epoch, so

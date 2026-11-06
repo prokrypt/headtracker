@@ -203,6 +203,12 @@ class MagCalibrator {
   }
   bool active = false;
   bool timeUp() const { return active && millis() - startMs >= kDurationMs; }
+  // The last calibration's samples, kept until the next one starts (for the
+  // 08 diagnostic dump).
+  int count() const { return n; }
+  const V &magAt(int i) const { return mag[i]; }
+  const V &gyroAt(int i) const { return gyro[i]; }
+  float dtAt(int i) const { return dts[i]; }
   uint32_t elapsedMs() const { return millis() - startMs; }
 
   // Every IMU sample (bias-corrected gyro), between magnetometer readings.
@@ -261,11 +267,22 @@ class MagCalibrator {
     m[2] = (mag[i].z - c.offset[2]) * c.scale[2];
   }
 
-  // a x^2 + b y^2 + c z^2 + d x + e y + f z = 1, least squares.
+  // a x^2 + b y^2 + c z^2 + d x + e y + f z = 1, least squares, on readings
+  // taken relative to their mean. The M5's own magnets (speaker) put the
+  // readings ~960uT off zero, 20x Earth's field: uncentered, zero then lies
+  // outside the ellipsoid, the form above flips sign and the fit was rejected
+  // (red after every calibration).
   bool fitEllipsoid(MagCal &c) {
+    double mean0[3] = {0, 0, 0};
+    for (int i = 0; i < n; ++i) {
+      mean0[0] += mag[i].x;
+      mean0[1] += mag[i].y;
+      mean0[2] += mag[i].z;
+    }
+    for (int k = 0; k < 3; ++k) mean0[k] /= n;
     double A[6][7] = {};
     for (int i = 0; i < n; ++i) {
-      double x = mag[i].x, y = mag[i].y, z = mag[i].z;
+      double x = mag[i].x - mean0[0], y = mag[i].y - mean0[1], z = mag[i].z - mean0[2];
       double row[6] = {x * x, y * y, z * z, x, y, z};
       for (int r = 0; r < 6; ++r) {
         for (int k = 0; k < 6; ++k) A[r][k] += row[r] * row[k];
@@ -290,7 +307,7 @@ class MagCalibrator {
     double g = 1 + p[3] * p[3] / (4 * p[0]) + p[4] * p[4] / (4 * p[1]) + p[5] * p[5] / (4 * p[2]);
     double rad[3];
     for (int k = 0; k < 3; ++k) {
-      c.offset[k] = -p[k + 3] / (2 * p[k]);
+      c.offset[k] = mean0[k] - p[k + 3] / (2 * p[k]);
       rad[k] = sqrt(g / p[k]);
     }
     double mean = cbrt(rad[0] * rad[1] * rad[2]);
