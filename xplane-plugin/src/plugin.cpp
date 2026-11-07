@@ -131,7 +131,7 @@ void sanitizeConfig() {
   fix(c.bodyRadiusCm, 0, 60, d.bodyRadiusCm);
   fix(c.bodyExtraYaw, 0, 3, d.bodyExtraYaw);
   fix(c.bodySmoothingMs, 0, 5000, d.bodySmoothingMs);
-  fix(c.leanCm, 0, 60, d.leanCm);
+  fix(c.leanCm, 0, 200, d.leanCm);
 }
 
 // Reads "key = value" lines into c. A profile only holds the tuning, not the
@@ -147,9 +147,10 @@ bool readIni(const std::string &file, Config &c, bool profile) {
     if (eq == std::string::npos) continue;
     std::string k = trim(line.substr(0, eq)), v = trim(line.substr(eq + 1));
     if (k == "sensor_forward" || k == "sensor_up") continue;  // old setting, the tracker calibrates itself now
-    if (profile && k == "device_name") continue;
+    if (profile && (k == "device_name" || k == "disable_at_start")) continue;
     try {
       if (k == "device_name") c.deviceName = v == "HeadTrackerC3" ? "" : v;  // old default name: any tracker now
+      else if (k == "disable_at_start") c.disableAtStart = v;
       else if (k == "gain_yaw") c.gainYaw = toNumber(v);
       else if (k == "gain_pitch") c.gainPitch = toNumber(v);
       else if (k == "gain_roll") c.gainRoll = toNumber(v);
@@ -338,7 +339,9 @@ Vec3 eyeOffset(const Angles &view) {
     pos = {pos.x + b.x, pos.y + b.y, pos.z + b.z};
   }
   if (gConfig.leanCm > 0) {
-    Vec3 l = leanOffset(view.roll, gConfig.leanCm / 100.0);
+    // Sideways relative to where the view looks (gSmoothed.yaw, after gain and
+    // body +view), so it matches the picture; the tilt itself is your real roll.
+    Vec3 l = leanOffset(view.roll, gSmoothed.yaw, gConfig.leanCm / 100.0);
     pos = {pos.x + l.x, pos.y + l.y, pos.z + l.z};
   }
   return pos;
@@ -515,7 +518,29 @@ bool gWasInCockpit = false;
 bool gReleased = false;  // true while we leave the head datarefs alone
 
 
+// Once per X-Plane run (this survives our own disable/enable, the library stays
+// loaded), on the first frame, when every plugin has started.
+bool gStartDisableDone = false;
+
+void disablePluginsAtStart() {
+  gStartDisableDone = true;
+  std::stringstream list(gConfig.disableAtStart);
+  std::string sig;
+  while (std::getline(list, sig, ',')) {
+    sig = trim(sig);
+    if (sig.empty()) continue;
+    XPLMPluginID id = XPLMFindPluginBySignature(sig.c_str());
+    if (id == XPLM_NO_PLUGIN_ID) debug("disable_at_start: no plugin " + sig);
+    else if (id == XPLMGetMyID()) continue;
+    else if (XPLMIsPluginEnabled(id)) {
+      XPLMDisablePlugin(id);
+      debug("disable_at_start: disabled " + sig + " (Plugin Admin turns it back on)");
+    }
+  }
+}
+
 float flightLoop(float elapsedSinceLastCall, float, int, void *) {
+  if (!gStartDisableDone) disablePluginsAtStart();
   std::string msg;
   while (gLink && gLink->popLog(msg)) debug(msg);
   if (!gLink) return -1;
@@ -705,6 +730,17 @@ void startHeadLog() {
 
 bool mountCalibrated() { return gLink && gLink->connected() && (gLink->latest().flags & 0x02); }
 
+// Bit 2 of the tracker's flags: C3 = the BNO085 rates its compass calibration
+// medium or better; M5 = its own fusion is using the compass right now.
+std::string compassText() {
+  if (!gLink || !gLink->connected() || !gLink->canCommand()) return "Compass: -";
+  bool good = gLink->latest().flags & 0x04;
+  bool m5 = gLink->trackerName().find("M5") != std::string::npos;
+  if (good) return m5 ? "Compass: correcting yaw" : "Compass: calibrated, holds yaw";
+  return m5 ? "Compass: not in use (button B calibrates it)"
+            : "Compass: calibrating (look around slowly, all directions)";
+}
+
 bool resetMount() {
   if (gCal.phase != CalPhase::Idle) return false;
   bool ok = gLink && gLink->send(BleLink::kCalReset);
@@ -735,10 +771,11 @@ Angles currentView() { return gSmoothed; }
 Vec3 currentEyeOffset() { return gAppliedPos; }
 
 void resetConfig() {
-  std::string name = gConfig.deviceName;
+  std::string name = gConfig.deviceName, off = gConfig.disableAtStart;
   gConfig = Config();
   sanitizeConfig();
   gConfig.deviceName = name;
+  gConfig.disableAtStart = off;
 }
 
 std::string statusText() {
@@ -764,7 +801,11 @@ bool saveConfig() {
          "# device_name: empty = connect to any tracker (HeadTracker-C3, HeadTracker-M5).\n"
          "# Set a name only to pick one when several are on. Changing it needs a\n"
          "# plugin reload (Plugin Admin) or restart.\n"
-      << "device_name = " << c.deviceName << "\n\n";
+      << "device_name = " << c.deviceName << "\n\n"
+      << "# disable_at_start: other plugins to switch off when X-Plane starts,\n"
+         "# comma-separated signatures (Log.txt shows each after \"Loaded:\", in\n"
+         "# brackets), e.g. 1-sim MiniHUD. Turn one back on in Plugin Admin.\n"
+      << "disable_at_start = " << c.disableAtStart << "\n\n";
   writeTuning(out, c);
   out << "\n# How the tracker sits on your head is measured by the tracker itself\n"
          "# (Calibrate in the settings window) and stored on it.\n";
@@ -799,6 +840,7 @@ bool loadProfile(const std::string &name) {
   // gets that setting's default; keep the hardware settings as they are.
   Config c;
   c.deviceName = gConfig.deviceName;
+  c.disableAtStart = gConfig.disableAtStart;
   if (!readIni(profilePath(name), c, true)) return false;
   gConfig = c;
   sanitizeConfig();

@@ -50,7 +50,7 @@ std::vector<Slider> gSliders = {
     {"Body: shift", &Config::bodyRadiusCm, 0.0, 40.0, 1.0, "%.0f cm"},
     {"Body: +view", &Config::bodyExtraYaw, 0.0, 1.0, 0.05, "%.2fx"},
     {"Body: lag", &Config::bodySmoothingMs, 0.0, 500.0, 10.0, "%.0f ms"},
-    {"Lean (roll)", &Config::leanCm, 0.0, 50.0, 1.0, "%.0f cm"},
+    {"Lean (roll)", &Config::leanCm, 0.0, 200.0, 1.0, "%.0f cm"},
 };
 std::vector<Check> gChecks = {
     {"Invert yaw", &Config::invertYaw},
@@ -61,7 +61,7 @@ std::vector<Check> gChecks = {
 };
 
 XPWidgetID gWindow = nullptr;
-XPWidgetID gStatus, gView, gEye, gEnabledBox, gRecenterBtn, gCalibrateBtn, gResetMountBtn;
+XPWidgetID gStatus, gView, gEye, gCompass, gEnabledBox, gRecenterBtn, gCalibrateBtn, gResetMountBtn;
 XPWidgetID gResetBtn, gSaveBtn, gMessage;
 XPWidgetID gProfileField, gPrevBtn, gNextBtn, gLoadBtn, gSaveAsBtn, gDeleteBtn, gAircraftBox;
 std::string gPendingDelete;  // Delete needs a second press to confirm
@@ -69,7 +69,9 @@ float gPendingDeleteTime = 0;
 XPLMMenuID gMenu = nullptr;
 float gLastRefresh = 0;
 
-const int kWidth = 420, kRow = 24, kLabelW = 95, kValueW = 70;
+// Two columns of sliders, so the window stays short enough for a small
+// screen or a big UI scale (one column cut off the bottom row).
+const int kWidth = 760, kRow = 24, kLabelW = 95, kValueW = 70, kGap = 20;
 
 void setText(XPWidgetID w, const std::string &s) { XPSetWidgetDescriptor(w, s.c_str()); }
 
@@ -291,70 +293,85 @@ int handler(XPWidgetMessage msg, XPWidgetID, intptr_t p1, intptr_t) {
 void createWindow() {
   int sl, st, sr, sb;
   XPLMGetScreenBoundsGlobal(&sl, &st, &sr, &sb);
-  int rows = 7 + int(gSliders.size()) + 6;
-  int height = rows * kRow + 40;
-  int left = sl + 80, top = st - 120;
+  // The height has to be known up front: resizing the window after adding
+  // the controls left them above its top (tried 2026-11-06). Keep this in
+  // step with the layout below (title 26, 8 rows, the slider column, 30 of gaps).
+  int perColumn = int(gSliders.size() + 1) / 2;
+  int height = 26 + (8 + perColumn) * kRow + 30;
+  int left = sl + 80, top = st - 80;
+  if (top - height < sb + 10) top = std::min(st - 10, sb + 10 + height);  // short screen
   gWindow = XPCreateWidget(left, top, left + kWidth, top - height, 0, "Head Tracker", 1, nullptr,
                            xpWidgetClass_MainWindow);
   XPSetWidgetProperty(gWindow, xpProperty_MainWindowHasCloseBoxes, 1);
   XPAddWidgetCallback(gWindow, handler);
 
   int l = left + 12, r = left + kWidth - 12;
+  int half = (r - l - kGap) / 2;
+  int ml = l + half + kGap;  // left edge of the right column
   int y = top - 26;
   gStatus = caption(l, y, r, "");
   y -= kRow;
-  gView = caption(l, y, r, "");
-  y -= kRow;
-  gEye = caption(l, y, r, "");
+  gView = caption(l, y, l + half, "");
+  gEye = caption(ml, y, r, "");
   y -= kRow;
   gEnabledBox = button(l, y, l + 20, "", true);
   caption(l + 24, y, l + 140, "Tracking on");
+  gCompass = caption(l + 150, y, r - 120, "");
   gRecenterBtn = button(r - 110, y, r, "Recenter", false);
   y -= kRow + 6;
 
   caption(l, y, l + 56, "Profile");
-  gProfileField = textField(l + 58, y, r - 176, 31);
-  gPrevBtn = button(r - 170, y, r - 142, "<", false);
-  gNextBtn = button(r - 138, y, r - 110, ">", false);
-  gLoadBtn = button(r - 100, y, r, "Load", false);
-  y -= kRow;
-  gSaveAsBtn = button(l, y, l + 90, "Save as", false);
-  gDeleteBtn = button(l + 96, y, l + 186, "Delete", false);
-  gAircraftBox = button(l + 200, y, l + 220, "", true);
-  caption(l + 224, y, r, "Load with this aircraft");
+  gProfileField = textField(l + 58, y, l + 230, 31);
+  gPrevBtn = button(l + 236, y, l + 264, "<", false);
+  gNextBtn = button(l + 268, y, l + 296, ">", false);
+  gLoadBtn = button(l + 302, y, l + 372, "Load", false);
+  gSaveAsBtn = button(l + 378, y, l + 458, "Save as", false);
+  gDeleteBtn = button(l + 464, y, l + 534, "Delete", false);
+  gAircraftBox = button(l + 546, y, l + 566, "", true);
+  caption(l + 570, y, r, "Load with this aircraft");
   y -= kRow + 6;
 
-  for (auto &s : gSliders) {
-    caption(l, y, l + kLabelW, s.label);
-    s.bar = XPCreateWidget(l + kLabelW, y, r - kValueW - 6, y - kRow + 6, 1, "", 0, gWindow,
+  // First half of the sliders on the left, the rest on the right.
+  int yLeft = y, yRight = y;
+  for (size_t i = 0; i < gSliders.size(); ++i) {
+    Slider &s = gSliders[i];
+    bool rightCol = int(i) >= perColumn;
+    int cl = rightCol ? ml : l, cr = rightCol ? r : l + half;
+    int &cy = rightCol ? yRight : yLeft;
+    caption(cl, cy, cl + kLabelW, s.label);
+    s.bar = XPCreateWidget(cl + kLabelW, cy, cr - kValueW - 6, cy - kRow + 6, 1, "", 0, gWindow,
                            xpWidgetClass_ScrollBar);
     XPSetWidgetProperty(s.bar, xpProperty_ScrollBarType, xpScrollBarTypeSlider);
     XPSetWidgetProperty(s.bar, xpProperty_ScrollBarMin, intptr_t(std::lround(s.min / s.step)));
     XPSetWidgetProperty(s.bar, xpProperty_ScrollBarMax, intptr_t(std::lround(s.max / s.step)));
     XPSetWidgetProperty(s.bar, xpProperty_ScrollBarPageAmount, 1);
-    s.value = caption(r - kValueW, y, r, "");
-    y -= kRow;
+    s.value = caption(cr - kValueW, cy, cr, "");
+    cy -= kRow;
   }
+  y = std::min(yLeft, yRight);
+  y -= 6;
 
+  // Invert boxes in one row; neck model and body turn, one per column, below.
   int cw = (r - l) / 3;
   for (size_t i = 0; i < gChecks.size(); ++i) {
-    if (i >= 3) y -= kRow;  // neck model and body turn get their own rows
-    int cl = i < 3 ? l + int(i) * cw : l;
+    if (i == 3) y -= kRow;
+    int cl = i < 3 ? l + int(i) * cw : (i == 3 ? l : ml);
+    int cr = i < 3 ? cl + cw : (i == 3 ? l + half : r);
     gChecks[i].box = button(cl, y, cl + 20, "", true);
-    caption(cl + 24, y, i < 3 ? cl + cw : r, gChecks[i].label);
+    caption(cl + 24, y, cr, gChecks[i].label);
   }
   y -= kRow + 6;
 
   caption(l, y, l + 120, "Tracker mounting");
-  gCalibrateBtn = button(l + 125, y, l + 255, "Calibrate...", false);
-  gResetMountBtn = button(r - 110, y, r, "Reset", false);
-  y -= kRow + 6;
-
-  gResetBtn = button(l, y, l + 130, "Reset to 1:1", false);
+  gCalibrateBtn = button(l + 125, y, l + 245, "Calibrate...", false);
+  gResetMountBtn = button(l + 251, y, l + half, "Reset", false);
+  gResetBtn = button(ml, y, ml + 130, "Reset to 1:1", false);
   gSaveBtn = button(r - 110, y, r, "Save default", false);
   y -= kRow;
   gMessage = caption(l, y, r, "Changes apply right away. Save default keeps them.");
+  y -= kRow;
 
+  if (y - 6 != top - height) debug("settings window: layout height doesn't match, fix createWindow");
   loadValues();
 }
 
@@ -400,6 +417,7 @@ void uiUpdate() {
   if (now - gLastRefresh < 0.1f) return;
   gLastRefresh = now;
   setText(gStatus, "Tracker: " + statusText());
+  setText(gCompass, compassText());
   // Calibration steps and results go to the message line, once per change so
   // other messages aren't overwritten all the time.
   static std::string lastCal;
@@ -408,15 +426,15 @@ void uiUpdate() {
   lastCal = cal;
   Angles v = currentView();
   char b[96];
-  std::snprintf(b, sizeof(b), "View offset:  yaw %+6.1f   pitch %+6.1f   roll %+6.1f", v.yaw, v.pitch,
+  std::snprintf(b, sizeof(b), "View:  yaw %+6.1f   pitch %+6.1f   roll %+6.1f", v.yaw, v.pitch,
                 v.roll);
   setText(gView, b);
-  if (config().neckModel || config().bodyTurn) {
+  if (config().neckModel || config().bodyTurn || config().leanCm > 0) {
     Vec3 p = currentEyeOffset();
-    std::snprintf(b, sizeof(b), "Eye offset:  x %+5.1f   y %+5.1f   z %+5.1f cm", p.x * 100, p.y * 100,
+    std::snprintf(b, sizeof(b), "Eye:  x %+5.1f   y %+5.1f   z %+5.1f cm", p.x * 100, p.y * 100,
                   p.z * 100);
   } else {
-    std::snprintf(b, sizeof(b), "Eye offset:  off");
+    std::snprintf(b, sizeof(b), "Eye:  off");
   }
   setText(gEye, b);
 }

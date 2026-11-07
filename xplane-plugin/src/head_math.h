@@ -46,11 +46,16 @@ inline Vec3 torsoOffset(double yawDeg, double radiusM) {
 // Side lean: tilting the head (roll) also leans the upper body, as when you
 // lean to look round a pillar. The eyes swing around a pivot `radiusM` below
 // the neck: sideways by radius * sin(roll), and down a little. Same axes as
-// neckOffset, roll + = tilt right = eyes move right. Added on top of the neck
-// model, which only swings them around the neck.
-inline Vec3 leanOffset(double rollDeg, double radiusM) {
-  double b = rollDeg * 3.14159265358979323846 / 180.0;
-  return {radiusM * std::sin(b), -radiusM * (1.0 - std::cos(b)), 0.0};
+// neckOffset, roll + = tilt right = eyes move to the right of where you look:
+// the lean turns with `yawDeg`, so looking back, a tilt right moves the eyes
+// to the aircraft's left. Added on top of the neck model, which only swings
+// them around the neck.
+inline Vec3 leanOffset(double rollDeg, double yawDeg, double radiusM) {
+  const double d = 3.14159265358979323846 / 180.0;
+  double b = rollDeg * d, y = yawDeg * d;
+  double side = radiusM * std::sin(b);
+  // your right, in cockpit axes: (cos yaw, 0, sin yaw); looking right (+90) it points aft
+  return {side * std::cos(y), -radiusM * (1.0 - std::cos(b)), side * std::sin(y)};
 }
 
 }  // namespace ht

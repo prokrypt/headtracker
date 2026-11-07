@@ -11,6 +11,10 @@ struct Config {
   // Empty: connect to any tracker (found by its service UUID). Set a name
   // (e.g. HeadTracker-M5) only to pick one when several are switched on.
   std::string deviceName;
+  // Other plugins to switch off once when X-Plane starts (comma-separated
+  // signatures, as Log.txt shows them after "Loaded:"). Plugin Admin can turn
+  // them back on; X-Plane itself doesn't remember a plugin being disabled.
+  std::string disableAtStart;
   double gainYaw = 1.0, gainPitch = 1.0, gainRoll = 1.0;  // 1:1 head-to-view by default
   bool invertYaw = false, invertPitch = false, invertRoll = false;
   double deadzoneDeg = 0.0;      // optional: ignore tiny movements around center
@@ -56,6 +60,7 @@ void startHeadLog();        // log the head datarefs at both flight-loop phases 
 bool startCalibration();    // "look ahead, then nod down", guided by voice and calibrationText()
 bool resetMount();          // forget the calibration: board flat, +Y to the nose
 bool mountCalibrated();     // the connected tracker has a stored calibration
+std::string compassText();  // "Compass: ..." status line for the settings window
 std::string calibrationText();  // current calibration step or last result, "" if none
 bool &trackingEnabled();
 std::string statusText();   // "Connected, 100 Hz" etc.
