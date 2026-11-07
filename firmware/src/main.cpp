@@ -47,6 +47,8 @@
 // magnetometer, so yaw doesn't drift, with heading corrections applied only
 // while the head moves (no visible creep). Its own sensor calibration (DCD)
 // runs all the time and is saved to the BNO085's flash when it's good.
+// BNO08x firmware without ARVR (like the GY-BNO08X's) gives the plain Rotation
+// Vector, whose corrections we spread over head motion ourselves (RvSmoother).
 //
 // Built with IMU_MPU6886=1 (pio env m5core) it runs on an M5Stack Core instead:
 // classic ESP32, its built-in MPU6886 + BMM150, fusion done here (see
@@ -511,13 +513,104 @@ static Q fakeSensorQ() {
 // Rotation report plus the BNO085's own dynamic calibration of all three
 // sensors. Both are lost when the BNO085 resets, so this runs after every
 // (re)start. The saved calibration (DCD) is loaded by the BNO085 at boot.
+// Every sensor event goes into this queue. The library's own getSensorEvent
+// decodes all events of one batch into the same buffer, so only the last one
+// survived: with gyro and rotation reports arriving together, most gyro samples
+// were lost (1.3.7: the smoothed view barely moved, then snapped).
+static const uint8_t EVQ_SIZE = 16;
+static sh2_SensorValue_t evQueue[EVQ_SIZE];
+static uint8_t evHead = 0, evCount = 0;
+// The library's I2C read never fills in the read time, so sh2's event
+// timestamps are only the sample's offset from the read (sh2 adds it to 0, as
+// a wrapped uint32). Put our clock under them, or consecutive gyro samples come
+// out 0 or negative apart (1.3.8: the view barely followed the gyro).
+static void onSensorEvent(void *, sh2_SensorEvent_t *e) {
+  e->timestamp_uS = (uint64_t)(esp_timer_get_time() + (int32_t)(uint32_t)e->timestamp_uS);
+  if (evCount == EVQ_SIZE) { evHead = (evHead + 1) % EVQ_SIZE; evCount--; }  // full: drop the oldest
+  if (sh2_decodeSensorEvent(&evQueue[(evHead + evCount) % EVQ_SIZE], e) == SH2_OK) evCount++;
+}
+static bool nextSensorEvent(sh2_SensorValue_t *v) {
+  if (evCount == 0) sh2_service();
+  if (evCount == 0) return false;
+  *v = evQueue[evHead];
+  evHead = (evHead + 1) % EVQ_SIZE;
+  evCount--;
+  return true;
+}
+
+// Our own ARVR-style stabilizing, for BNO08x firmware without the ARVR report.
+// The plain Rotation Vector applies its corrections at once: after a head turn
+// (accelerometer disturbed, gyro scale error) the tilt snaps back to gravity a
+// moment after the head stops, so the view jumps up or down. Here the output
+// follows the BNO's calibrated gyro, and the Rotation Vector only pulls it
+// along: up to a quarter of the angle the head is turning through (hidden in
+// the motion), plus a slow 0.3 deg/s when still. Big disagreements (> 25 deg)
+// snap at once. Without gyro reports it passes the Rotation Vector through.
+struct RvSmoother {
+  static constexpr float kMotionShare = 0.25f;
+  static constexpr float kBaseRate = 0.3f * (float)M_PI / 180.0f;  // rad/s
+  static constexpr float kSnap = 25.0f * (float)M_PI / 180.0f;
+  Q out;
+  bool init = false;
+  uint64_t gyroTs = 0, rvTs = 0;
+  uint32_t lastGyroMs = 0;
+  float motion = 0;     // rad turned (gyro) since the last Rotation Vector
+  float maxErr = 0;     // largest correction held back since the last log line (rad)
+  uint32_t snaps = 0, gyroUsed = 0, gyroSkipped = 0, rvCount = 0;
+
+  void reset() { init = false; gyroTs = rvTs = 0; lastGyroMs = 0; motion = 0; }
+
+  void gyro(float x, float y, float z, uint64_t ts) {
+    lastGyroMs = millis();
+    uint64_t prev = gyroTs;
+    gyroTs = ts;
+    if (!init || prev == 0) return;
+    float dt = (float)(int64_t)(ts - prev) * 1e-6f;
+    if (dt <= 0 || dt > 0.05f) { gyroSkipped++; return; }
+    gyroUsed++;
+    Q dq = qmul(out, Q{0, x, y, z});  // q' = q * (0, w) / 2, w in the sensor frame
+    out = qnorm(Q{out.w + 0.5f * dt * dq.w, out.x + 0.5f * dt * dq.x, out.y + 0.5f * dt * dq.y,
+                  out.z + 0.5f * dt * dq.z});
+    motion += sqrtf(x * x + y * y + z * z) * dt;
+  }
+
+  Q rv(const Q &q, uint64_t ts) {
+    float dt = rvTs ? (float)(int64_t)(ts - rvTs) * 1e-6f : 0;
+    rvTs = ts;
+    rvCount++;
+    if (dt < 0 || dt > 0.1f) dt = 0;
+    bool gyroLive = lastGyroMs != 0 && millis() - lastGyroMs < 100;
+    if (!init || !gyroLive) { out = q; init = true; motion = 0; return q; }
+    Q d = qmul(q, qconj(out));  // world-frame rotation from our output to the RV
+    if (d.w < 0) d = Q{-d.w, -d.x, -d.y, -d.z};
+    float s = sqrtf(d.x * d.x + d.y * d.y + d.z * d.z);
+    float angle = 2.0f * atan2f(s, d.w);
+    float allowed = kMotionShare * motion + kBaseRate * dt;
+    motion = 0;
+    if (angle > maxErr) maxErr = angle;
+    if (angle > kSnap) { out = q; snaps++; return out; }
+    if (angle <= allowed || s < 1e-7f) { out = q; return out; }
+    float h = 0.5f * allowed;  // turn `allowed` rad about d's axis
+    float k = sinf(h) / s;
+    out = qnorm(qmul(Q{cosf(h), d.x * k, d.y * k, d.z * k}, out));
+    return out;
+  }
+};
+static RvSmoother rvSmoother;
+
 static bool enableRotation() {
   sh2_setCalConfig(SH2_CAL_ACCEL | SH2_CAL_GYRO | SH2_CAL_MAG);
   // We save it ourselves (saveDcdIfGood): only good calibrations, and rarely,
   // because the BNO085's flash wears out after some tens of thousands of erases.
   sh2_setDcdAutoSave(false);
   bnoAccuracy = 0;
-  return bno.enableReport(rotationReport, REPORT_INTERVAL_US);
+  rvSmoother.reset();
+  bool ok = bno.enableReport(rotationReport, REPORT_INTERVAL_US);
+  // The plain Rotation Vector gets smoothed by us, which needs the gyro.
+  if (ok && rotationReport == SH2_ROTATION_VECTOR &&
+      !bno.enableReport(SH2_GYROSCOPE_CALIBRATED, REPORT_INTERVAL_US))
+    Serial.println("Gyro report not enabled, Rotation Vector corrections not smoothed");
+  return ok;
 }
 
 // While running: at "high" accuracy, at most every 30 minutes. On the way to
@@ -574,6 +667,9 @@ static bool startSensor() {
       // call, a null pointer until the first one: a report arriving during a
       // command (enableReport, DCD save) crashed the C3. Point it at ours now.
       bno.getSensorEvent(&sensorValue);
+      // From here on events go to our queue instead (see onSensorEvent).
+      evHead = evCount = 0;
+      sh2_setSensorCallback(onSensorEvent, nullptr);
       Serial.printf("BNO08x at 0x%02x, firmware", addr);
       for (int e = 0; e < bno.prodIds.numEntries; e++) {
         const sh2_ProductId_t &p = bno.prodIds.entry[e];
@@ -1243,7 +1339,10 @@ void loop() {
     // queued (a reply to the sleep command, a last sample), INT stays low until
     // it's read, and the chip would never get to sleep. So read it out.
 #if !FAKE_SENSOR && !IMU_MPU6886
-    for (int i = 0; i < 8 && digitalRead(PIN_BNO_INT) == LOW; ++i) bno.getSensorEvent(&sensorValue);
+    for (int i = 0; i < 8 && digitalRead(PIN_BNO_INT) == LOW; ++i) {
+      sh2_service();
+      evCount = 0;  // nobody listening: drop them
+    }
 #endif
     // Nothing to send: sleep until the LED needs to change, but check for a
     // new subscriber (X-Plane connecting) at least every 250 ms.
@@ -1304,24 +1403,43 @@ void loop() {
     intWired = true;
   }
 
-  // Drain whatever is queued and keep the newest rotation. Copy it out as it
-  // arrives: a later event of another kind would overwrite sensorValue.
-  bool got = false;
+  // Drain whatever is queued: every gyro sample, and the newest rotation.
+  bool got = false, gotAny = false;
   float q[4];
-  while (bno.getSensorEvent(&sensorValue)) {
-    if (sensorValue.sensorId == rotationReport) {
+  while (nextSensorEvent(&sensorValue)) {
+    gotAny = true;
+    if (sensorValue.sensorId == SH2_GYROSCOPE_CALIBRATED) {
+      const auto &g = sensorValue.un.gyroscope;
+      rvSmoother.gyro(g.x, g.y, g.z, sensorValue.timestamp);
+    } else if (sensorValue.sensorId == rotationReport) {
       const auto &rv = rotationReport == SH2_ARVR_STABILIZED_RV ? sensorValue.un.arvrStabilizedRV
                                                                   : sensorValue.un.rotationVector;
-      q[0] = rv.real;
-      q[1] = rv.i;
-      q[2] = rv.j;
-      q[3] = rv.k;
+      Q s{rv.real, rv.i, rv.j, rv.k};
+      if (rotationReport == SH2_ROTATION_VECTOR) s = rvSmoother.rv(qnorm(s), sensorValue.timestamp);
+      q[0] = s.w;
+      q[1] = s.x;
+      q[2] = s.y;
+      q[3] = s.z;
       bnoAccuracy = sensorValue.status & 0x03;
       got = true;
     }
-    if (digitalRead(PIN_BNO_INT) == HIGH) break;
+    if (evCount == 0 && digitalRead(PIN_BNO_INT) == HIGH) break;
+  }
+  // Every 10s: the largest correction we spread out (the jump you'd have seen).
+  static uint32_t lastSmoothLog = 0;
+  if (millis() - lastSmoothLog > 10000) {
+    lastSmoothLog = millis();
+    if (rvSmoother.rvCount)
+      Serial.printf("RV smoothing (10s): largest correction %.1f deg, %lu snapped, %lu RV, gyro %lu used %lu skipped\n",
+                    rvSmoother.maxErr * 180.0f / (float)M_PI, (unsigned long)rvSmoother.snaps,
+                    (unsigned long)rvSmoother.rvCount, (unsigned long)rvSmoother.gyroUsed,
+                    (unsigned long)rvSmoother.gyroSkipped);
+    rvSmoother.maxErr = 0;
+    rvSmoother.snaps = rvSmoother.gyroUsed = rvSmoother.gyroSkipped = rvSmoother.rvCount = 0;
   }
   if (!got) {
+    if (gotAny) return;  // only a gyro report this time
+
     // INT low but nothing to read (sensor wedged or mid-reset): don't spin,
     // or the idle task starves and the chip never sleeps.
     vTaskDelay(1);
